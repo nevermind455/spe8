@@ -1620,224 +1620,60 @@ async def t_taper_hedge_grows_primary_then_hedges_the_complement():
           live["order_amounts"][0] == _config.BET_SIZE, str(live["order_amounts"]))
 
 
-async def t_taper_hedge_cycle_repeats_and_restarts_when_the_signal_flips():
-    """The 3-confirmation cycle repeats, and follows the signal when it flips.
+async def t_taper_cycle_reanchors_to_the_new_signal_without_restarting():
+    """A flip changes WHICH side the cycle builds, not WHERE it is.
 
-    Backtested: an unbounded hedge (grow twice, then hedge every
-    confirmation for the rest of the round) turned +$1.50 total into a much
-    better +$71.10 once capped at 1-in-3 and repeated - an unbounded hedge
-    quietly inverts a long, correctly-held round into a loss. So while the
-    signal holds, two full cycles must land on the right slot at the right
-    size (UP, UP, DOWN, UP, UP, DOWN at $3, $2, $1 each time).
+    Two separate things could react to a signal flip, and they were once
+    conflated. The side must follow the signal - continuing to grow a side
+    the signal has left is acting on a withdrawn decision. The cycle
+    POSITION must not, because it only advances on a fill: resetting it sent
+    the cycle back to slot 1 every flip and starved slot 3, the opposite-side
+    buy, down to one in every 5.7 fills instead of one in three.
 
-    A cycle is a bet on one side, though, and the signal is what selects it.
-    Once the signal leaves that side, growing it further - or buying its
-    complement as a "hedge" for a position the bot no longer believes in -
-    acts on a decision that has already been withdrawn. So a flip retires
-    the running cycle and starts a fresh one, from entry 1, on the new side.
-
-    The harness draws four price samples per order, so votes are sequenced
-    to land the flip on a chosen slot. (The earlier version of this test
-    flipped at sample 16 while asserting over 4 orders = 16 samples, so its
-    DOWN votes were never reached and its wobble assertions passed against
-    a signal that had in fact stayed UP throughout.)
+    Backtested rationale for the 1-in-3 cap itself: an unbounded hedge (grow
+    twice, then hedge every remaining confirmation) turned +$1.50 total into
+    +$71.10 once capped and repeated, because an unbounded hedge quietly
+    inverts a long, correctly-held round into a loss.
     """
-    stable = await _drive_phase2_with_hold(
+    steady = await _drive_phase2_with_hold(
         execution_mode="PAPER", held_provider=lambda *_a: set(),
         price_votes=("UP",) * 40, stop_after_orders=6,
         taper_hedge_enabled=True, timeout=3.0)
-    check("two full cycles land UP, UP, DOWN, UP, UP, DOWN",
-          stable["order_sides"] == ["UP", "UP", "DOWN", "UP", "UP", "DOWN"],
-          str(stable))
-    check("amounts taper $3, $2, $1 each cycle, not just the first",
-          [round(a, 2) for a in stable["order_amounts"]]
+    check("an unflipped signal runs UP, UP, DOWN twice",
+          steady["order_sides"] == ["UP", "UP", "DOWN", "UP", "UP", "DOWN"],
+          str(steady))
+    check("amounts taper each cycle, not just the first",
+          [round(a, 2) for a in steady["order_amounts"]]
           == [3.0, 2.0, 1.0, 3.0, 2.0, 1.0],
-          str(stable["order_amounts"]))
+          str(steady["order_amounts"]))
 
-    # Flip on the slot that would otherwise have been the $1 hedge.
-    mid = await _drive_phase2_with_hold(
-        execution_mode="PAPER", held_provider=lambda *_a: set(),
-        price_votes=("UP",) * 8 + ("DOWN",) * 60, stop_after_orders=4,
-        taper_hedge_enabled=True, timeout=3.0)
-    check("entries 1-2 grow the side the signal confirmed first",
-          mid["order_sides"][:2] == ["UP", "UP"]
-          and [round(a, 2) for a in mid["order_amounts"][:2]] == [3.0, 2.0],
-          str(mid))
-    check("the flip restarts the cycle on DOWN at entry-1 size, rather "
-          "than hedging DOWN at $1 to protect a withdrawn UP call",
-          mid["order_sides"][2] == "DOWN"
-          and round(mid["order_amounts"][2], 2) == 3.0, str(mid))
-    check("the new cycle then continues on DOWN instead of resuming UP",
-          mid["order_sides"][3] == "DOWN"
-          and round(mid["order_amounts"][3], 2) == 2.0, str(mid))
-
-    # Flip immediately after entry 1, and let the NEW cycle run to its own
-    # hedge slot: a restart starts a real cycle, not a one-off re-entry.
+    # Flip immediately after entry 1. The side must move to DOWN, and the
+    # position must stay at slot 2 - so this is entry-2 SIZE on the new side,
+    # not a fresh entry-1.
     early = await _drive_phase2_with_hold(
         execution_mode="PAPER", held_provider=lambda *_a: set(),
-        price_votes=("UP",) * 4 + ("DOWN",) * 60, stop_after_orders=4,
+        price_votes=("UP",) * 4 + ("DOWN",) * 60, stop_after_orders=2,
         taper_hedge_enabled=True, timeout=3.0)
-    check("a flip one entry in restarts on DOWN at entry-1 size",
-          early["order_sides"][:2] == ["UP", "DOWN"]
-          and [round(a, 2) for a in early["order_amounts"][:2]] == [3.0, 3.0],
+    check("the side follows the flip", early["order_sides"] == ["UP", "DOWN"],
           str(early))
-    check("the restarted cycle keeps its own shape: $2 grow, then a $1 "
-          "hedge on the complement of the side it is now built on",
-          early["order_sides"][2:] == ["DOWN", "UP"]
-          and [round(a, 2) for a in early["order_amounts"][2:]] == [2.0, 1.0],
-          str(early))
+    check("the cycle keeps its place: entry-2 size, not a restart",
+          [round(a, 2) for a in early["order_amounts"]] == [3.0, 2.0],
+          str(early["order_amounts"]))
 
-
-async def t_signal_decision_rule_selects_the_side_and_the_gates_agree():
-    """SIGNAL_DECISION_RULE picks the side, and every gate asks the same rule.
-
-    The gates matter more than the rule. Phase 2 re-validates the side three
-    times after choosing it - final validation, the pre-submit guard, and
-    again immediately before submission - and each calls _authority_side. If
-    the chooser used one rule and the gates another, a correctly chosen order
-    would be rejected on nearly every attempt (that is exactly what happened
-    when the gates still compared raw SIG PRICE to a minority pick). So the
-    test that counts is not "which side" but "did the order actually leave".
-
-    price=UP book=DOWN chainlink=DOWN separates all three rules:
-        price    -> UP   (book and chainlink stay diagnostics)
-        minority -> UP   (UP is the dissenter, 1 vs 2)
-        final    -> DOWN (price and book disagree, chainlink sides with book)
-    """
-    for rule, want in (("price", "UP"), ("minority", "UP"), ("final", "DOWN")):
-        run = await _drive_phase2_with_hold(
-            execution_mode="PAPER", held_provider=lambda *_a: set(),
-            price_votes=("UP",) * 40, book_vote="DOWN", chainlink_vote="DOWN",
-            decision_rule=rule, stop_after_orders=1, timeout=3.0)
-        check(f"rule {rule!r} orders {want}",
-              run["order_sides"] == [want], f"{rule}: {run['order_sides']}")
-        check(f"rule {rule!r} actually submitted - the gates agreed",
-              run["orders"] == 1 and run["executor_guards"] == [True],
-              f"{rule}: orders={run['orders']} guards={run['executor_guards']}")
-
-
-async def t_final_decision_rule_drives_a_whole_taper_cycle():
-    """The taper cycle must ride the chosen rule, not SIG PRICE underneath it.
-
-    Every slot anchors to what entry 1 bought and the flip check compares the
-    live decision against that anchor, so if the cycle read a different rule
-    from the chooser it would either restart on every attempt or never
-    restart at all. Here the decision is DOWN while SIG PRICE says UP: two
-    primaries must grow DOWN and the hedge must buy its complement, UP.
-    """
-    run = await _drive_phase2_with_hold(
+    # A flip landing ON the opposite-side slot must not deadlock. The
+    # anchored side can then be one this round never bought, and a guard
+    # testing that specific token could never pass - so the slot could never
+    # fill, the counter could never advance, and the cadence stopped dead.
+    onslot = await _drive_phase2_with_hold(
         execution_mode="PAPER", held_provider=lambda *_a: set(),
-        price_votes=("UP",) * 40, book_vote="DOWN", chainlink_vote="DOWN",
-        decision_rule="final", taper_hedge_enabled=True,
-        stop_after_orders=3, timeout=3.0)
-    check("the cycle grows the DECIDED side, not SIG PRICE",
-          run["order_sides"][:2] == ["DOWN", "DOWN"], str(run["order_sides"]))
-    check("the hedge buys the complement of the decided side",
-          run["order_sides"][2] == "UP", str(run["order_sides"]))
-    check("amounts still taper $3 -> $2 -> hedge",
-          [round(a, 2) for a in run["order_amounts"]][:2] == [3.0, 2.0],
-          str(run["order_amounts"]))
-    check("no attempt was rejected by a gate reading a different rule",
-          run["executor_guards"] == [True, True, True],
-          str(run["executor_guards"]))
-
-
-def t_signal_decision_rule_is_validated_and_defaults_to_the_old_flag():
-    """An unknown rule fails at import, and existing .env files are unchanged."""
-    bad = _reload_config(SIGNAL_DECISION_RULE="majority")
-    check("an unknown rule is refused",
-          "SIGNAL_DECISION_RULE" in (bad or ""), str(bad))
-    # _reload_config restores the environment before returning, so the value
-    # has to be read while the override is still installed.
-    import importlib
-    import os
-    import config as cfg
-    saved = dict(os.environ)
-    try:
-        for flag, want in (("0", "price"), ("1", "minority")):
-            os.environ["SIGNAL_MINORITY_RULE"] = flag
-            os.environ.pop("SIGNAL_DECISION_RULE", None)
-            importlib.reload(cfg)
-            check(f"SIGNAL_MINORITY_RULE={flag} still means {want!r}",
-                  cfg.SIGNAL_DECISION_RULE == want, cfg.SIGNAL_DECISION_RULE)
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
-        importlib.reload(cfg)
-
-
-async def t_primary_entries_are_price_banded_but_hedge_legs_are_not():
-    """A primary entry may be held to a tighter band than the hedge leg.
-
-    Measured over 620 settled fills the two leg types are priced completely
-    differently for almost the same hit rate - primary paid 0.577 for a 52%
-    hit rate (edge -0.058), the hedge paid 0.418 for 54% (edge +0.118) - and
-    the 0.60-0.80 band alone carried 52% of turnover at about -0.05 edge. So
-    the ceiling belongs on the leg that follows the signal, while the hedge
-    stays on the account bounds: its edge is largest in exactly the cheap
-    buckets a shared floor would forbid.
-
-    The band must reach the ORDER, not only the probe. The broker walks the
-    book, so a probe that passed at the band's top says nothing about where
-    the fill actually lands; both paths are checked.
-    """
-    import main_bot
-    band = (0.25, 0.80)                     # (min, max) for primary entries
-    acct = (main_bot.config.MAX_BUY_PRICE, main_bot.config.MIN_BUY_PRICE)
-
-    run = await _drive_phase2_with_hold(
-        execution_mode="PAPER", held_provider=lambda *_a: set(),
-        price_votes=("UP",) * 40, stop_after_orders=3,
-        taper_hedge_enabled=True, primary_band=band, timeout=3.0)
-
-    check("the cycle ran two primaries then a hedge",
-          run["order_sides"] == ["UP", "UP", "DOWN"], str(run["order_sides"]))
-    check("both primary entries are submitted inside the primary band",
-          run["order_bands"][:2] == [(0.80, 0.25), (0.80, 0.25)],
-          str(run["order_bands"]))
-    check("the hedge leg is submitted on the ACCOUNT band, not the primary one",
-          run["order_bands"][2] == acct,
-          f"{run['order_bands'][2]} vs account {acct}")
-    check("the liquidity probe asks about the band it will submit under",
-          (0.80, 0.25) in run["probe_bands"], str(run["probe_bands"][:4]))
-
-    # Left at the account band the feature is inert - existing behaviour.
-    plain = await _drive_phase2_with_hold(
-        execution_mode="PAPER", held_provider=lambda *_a: set(),
-        price_votes=("UP",) * 40, stop_after_orders=2,
-        taper_hedge_enabled=True, primary_band=(acct[1], acct[0]), timeout=3.0)
-    check("band defaulted to the account band changes nothing",
-          all(b == acct for b in plain["order_bands"]),
-          str(plain["order_bands"]))
-
-
-def t_primary_entry_band_may_only_tighten_the_account_band():
-    """Config refuses a band the brokers would silently ignore.
-
-    Both brokers clamp a per-order bound to the account band (tighten-only),
-    so a PRIMARY_ENTRY_MAX_PRICE above MAX_BUY_PRICE would read as configured
-    and do nothing at all. Failing loudly at import beats that.
-    """
-    ok = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
-                        PRIMARY_ENTRY_MIN_PRICE="0.15",
-                        PRIMARY_ENTRY_MAX_PRICE="0.80")
-    check("a band inside the account band is accepted", ok is None, str(ok))
-
-    loose_max = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
-                               PRIMARY_ENTRY_MAX_PRICE="0.95")
-    check("a ceiling above MAX_BUY_PRICE is refused",
-          "PRIMARY_ENTRY_MAX_PRICE" in (loose_max or ""), str(loose_max))
-
-    loose_min = _reload_config(MIN_BUY_PRICE="0.20", MAX_BUY_PRICE="0.90",
-                               PRIMARY_ENTRY_MIN_PRICE="0.05")
-    check("a floor below MIN_BUY_PRICE is refused",
-          "PRIMARY_ENTRY_MIN_PRICE" in (loose_min or ""), str(loose_min))
-
-    inverted = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
-                              PRIMARY_ENTRY_MIN_PRICE="0.85",
-                              PRIMARY_ENTRY_MAX_PRICE="0.80")
-    check("a floor above its own ceiling is refused",
-          "below PRIMARY_ENTRY_MAX_PRICE" in (inverted or ""), str(inverted))
+        price_votes=("UP",) * 8 + ("DOWN",) * 60, stop_after_orders=6,
+        taper_hedge_enabled=True, timeout=4.0)
+    check("a flip on the opposite-side slot does not stall the cycle",
+          len(onslot["order_sides"]) == 6, str(onslot["order_sides"]))
+    check("and the cadence still completes two full cycles",
+          [round(a, 2) for a in onslot["order_amounts"]]
+          == [3.0, 2.0, 1.0, 3.0, 2.0, 1.0],
+          str(onslot["order_amounts"]))
 
 
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():

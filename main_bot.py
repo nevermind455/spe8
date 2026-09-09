@@ -1191,18 +1191,24 @@ async def run_bot():
                 # signal has left that side, continuing to grow it - or to
                 # buy its complement as a "hedge" for a position the bot no
                 # longer believes in - is acting on a decision that has
-                # already been withdrawn. So a flip retires the running
-                # cycle and begins a fresh one, from entry 1, on the side
-                # the signal now names. Shares already bought are left
-                # alone: this changes what happens next, not what filled.
+                # already been withdrawn. So a flip RE-ANCHORS the cycle to
+                # the side the signal now names.
+                #
+                # It does NOT restart the count. An earlier version reset
+                # taper_count to 0 here, which looked harmless and quietly
+                # destroyed the cadence: the counter only advances on a FILL,
+                # so every flip sent the cycle back to slot 0 and slot 2 -
+                # the opposite-side buy - was rarely reached at all. Measured
+                # over 915 filled entries that produced 4.7 signal-side buys
+                # per opposite-side buy instead of the intended 2. Keeping
+                # the position makes the cadence hold at 2:1 whatever the
+                # signal does. Shares already bought are left alone either
+                # way: this changes what happens next, not what filled.
                 if taper_primary_side is not None and side != taper_primary_side:
                     print(f"{_ts()} [TAPER] Signal flipped "
-                          f"{taper_primary_side} -> {side} after "
-                          f"{taper_count} filled "
-                          f"{'entry' if taper_count == 1 else 'entries'}; "
-                          f"retiring that cycle and restarting on {side}.")
-                    taper_count = 0
-                    taper_primary_side = None
+                          f"{taper_primary_side} -> {side} at cycle slot "
+                          f"{taper_count % 3 + 1}/3; re-anchoring, cadence kept.")
+                    taper_primary_side = side
                 taper_anchor_side = taper_primary_side or side
                 cycle_pos = taper_count % 3
                 if cycle_pos == 0:
@@ -1335,18 +1341,27 @@ async def run_bot():
             other_token = down_id if side == "UP" else up_id
             if taper_active:
                 if is_taper_hedge:
-                    # entry_side is the complement of taper_anchor_side (the
-                    # side entry 1 actually bought), not of the live `side`
-                    # above - see where entry_side was computed. Buying it
-                    # only makes sense if that anchored primary side actually
-                    # filled; if it didn't, there is nothing to hedge, so
-                    # this attempt is skipped rather than silently buying an
-                    # unrelated, unhedged complement position.
-                    primary_token = up_id if taper_anchor_side == "UP" else down_id
-                    if primary_token not in held_tokens:
+                    # entry_side is the complement of taper_anchor_side, not
+                    # of the live `side` - see where entry_side was computed.
+                    # The point of the guard is that a complement bought
+                    # against nothing held is not a hedge, just an unrelated
+                    # naked position.
+                    #
+                    # It deliberately asks whether ANY leg is held this round,
+                    # not whether one specific token is. Since a flip
+                    # re-anchors the cycle without restarting it, the anchored
+                    # side at slot 3 can be a side this round never bought -
+                    # and testing that token deadlocked the cycle: the slot
+                    # could never fill, so the counter could never advance
+                    # past it, so the cadence stopped dead on the first flip
+                    # that landed here. Slot 3 is only reachable after two
+                    # fills, so this stays a genuine safety net rather than a
+                    # formality, while no longer depending on WHICH side those
+                    # fills were on.
+                    if not held_tokens:
                         print(f"{_ts()} [RISK] No order: taper hedge has "
-                              f"nothing to hedge yet (primary side not "
-                              f"filled this round).")
+                              f"nothing to hedge yet (no leg filled this "
+                              f"round).")
                         await _cooldown()
                         continue
                 # else: this attempt grows the already-anchored primary side

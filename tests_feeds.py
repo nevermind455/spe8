@@ -1643,7 +1643,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # place - _authority_side - which the phase-2 chooser and all three
     # re-validation gates now share, so a gate can no longer evaluate a
     # different rule from the chooser and reject its orders.
-    "main_bot.py": "9bdaf9ae1512bef853e426b37164e3b69af30e58d835b3ecc4dd2fe0c99290ad",
+    # main_bot.py re-approved 2026-09-09: a signal flip re-anchors the taper
+    # cycle to the new side but keeps its position. Resetting the count
+    # starved the opposite-side slot to 1-in-5.7 fills instead of 1-in-3.
+    "main_bot.py": "0d7c78c1bd65dce762ee752a89cc45d78f3e3a94d6e2f44178cd6cf3a26729a8",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
