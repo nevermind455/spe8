@@ -1638,7 +1638,12 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # - a tighter price band for primary phase-2 entries, with taper hedge legs
     # left on the account bounds. Measured over 620 settled fills: primary paid
     # 0.577 for a 52% hit rate (edge -0.058), hedge paid 0.418 for 54% (+0.118).
-    "main_bot.py": "a6560ef13d53d7d9fdd16d99aae896a105e7c64a25b92e1b016d9430ec1652c5",
+    # main_bot.py, config.py re-approved 2026-09-09: SIGNAL_DECISION_RULE
+    # (price | minority | final) chooses the order side, read in exactly one
+    # place - _authority_side - which the phase-2 chooser and all three
+    # re-validation gates now share, so a gate can no longer evaluate a
+    # different rule from the chooser and reject its orders.
+    "main_bot.py": "9bdaf9ae1512bef853e426b37164e3b69af30e58d835b3ecc4dd2fe0c99290ad",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
@@ -1646,7 +1651,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "07fa9d9b9a00c90b5b8b375376147d8e563aa6b8f74c2a12674ce556db9e5fba",
+    "config.py": "993040e0dc15d1e8521e232cc3b6ead51a2fdb8368c36441d22f5d6267917c0e",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

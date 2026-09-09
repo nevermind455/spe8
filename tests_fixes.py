@@ -1123,7 +1123,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   stop_after_orders=1,
                                   allow_signal_flips=False,
                                   taper_hedge_enabled=False, token_books=None,
-                                  liquidity_probe=None, primary_band=None):
+                                  liquidity_probe=None, primary_band=None,
+                                  decision_rule=None):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1238,6 +1239,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "CANCEL_OPEN_BEFORE_TRADE", False)
         replace(main_bot.config, "PAPER_ALLOW_SIGNAL_FLIPS", allow_signal_flips)
         replace(main_bot.config, "SIGNAL_MINORITY_RULE", minority_rule)
+        replace(main_bot.config, "SIGNAL_DECISION_RULE",
+                decision_rule or ("minority" if minority_rule else "price"))
         replace(main_bot.config, "TAPER_HEDGE_ENABLED", taper_hedge_enabled)
         if primary_band is not None:
             replace(main_bot.config, "PRIMARY_ENTRY_MIN_PRICE", primary_band[0])
@@ -1536,6 +1539,7 @@ def t_pre_submit_guard_explains_why_it_refused():
         replace(main_bot.orderbook, "get_orderbook", lambda *_a, **_k: ((), ()))
         replace(main_bot.orderbook, "liquidity_signal", lambda *_a, **_k: "UP")
         replace(main_bot.config, "SIGNAL_MINORITY_RULE", True)
+        replace(main_bot.config, "SIGNAL_DECISION_RULE", "minority")
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1682,6 +1686,84 @@ async def t_taper_hedge_cycle_repeats_and_restarts_when_the_signal_flips():
           early["order_sides"][2:] == ["DOWN", "UP"]
           and [round(a, 2) for a in early["order_amounts"][2:]] == [2.0, 1.0],
           str(early))
+
+
+async def t_signal_decision_rule_selects_the_side_and_the_gates_agree():
+    """SIGNAL_DECISION_RULE picks the side, and every gate asks the same rule.
+
+    The gates matter more than the rule. Phase 2 re-validates the side three
+    times after choosing it - final validation, the pre-submit guard, and
+    again immediately before submission - and each calls _authority_side. If
+    the chooser used one rule and the gates another, a correctly chosen order
+    would be rejected on nearly every attempt (that is exactly what happened
+    when the gates still compared raw SIG PRICE to a minority pick). So the
+    test that counts is not "which side" but "did the order actually leave".
+
+    price=UP book=DOWN chainlink=DOWN separates all three rules:
+        price    -> UP   (book and chainlink stay diagnostics)
+        minority -> UP   (UP is the dissenter, 1 vs 2)
+        final    -> DOWN (price and book disagree, chainlink sides with book)
+    """
+    for rule, want in (("price", "UP"), ("minority", "UP"), ("final", "DOWN")):
+        run = await _drive_phase2_with_hold(
+            execution_mode="PAPER", held_provider=lambda *_a: set(),
+            price_votes=("UP",) * 40, book_vote="DOWN", chainlink_vote="DOWN",
+            decision_rule=rule, stop_after_orders=1, timeout=3.0)
+        check(f"rule {rule!r} orders {want}",
+              run["order_sides"] == [want], f"{rule}: {run['order_sides']}")
+        check(f"rule {rule!r} actually submitted - the gates agreed",
+              run["orders"] == 1 and run["executor_guards"] == [True],
+              f"{rule}: orders={run['orders']} guards={run['executor_guards']}")
+
+
+async def t_final_decision_rule_drives_a_whole_taper_cycle():
+    """The taper cycle must ride the chosen rule, not SIG PRICE underneath it.
+
+    Every slot anchors to what entry 1 bought and the flip check compares the
+    live decision against that anchor, so if the cycle read a different rule
+    from the chooser it would either restart on every attempt or never
+    restart at all. Here the decision is DOWN while SIG PRICE says UP: two
+    primaries must grow DOWN and the hedge must buy its complement, UP.
+    """
+    run = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, book_vote="DOWN", chainlink_vote="DOWN",
+        decision_rule="final", taper_hedge_enabled=True,
+        stop_after_orders=3, timeout=3.0)
+    check("the cycle grows the DECIDED side, not SIG PRICE",
+          run["order_sides"][:2] == ["DOWN", "DOWN"], str(run["order_sides"]))
+    check("the hedge buys the complement of the decided side",
+          run["order_sides"][2] == "UP", str(run["order_sides"]))
+    check("amounts still taper $3 -> $2 -> hedge",
+          [round(a, 2) for a in run["order_amounts"]][:2] == [3.0, 2.0],
+          str(run["order_amounts"]))
+    check("no attempt was rejected by a gate reading a different rule",
+          run["executor_guards"] == [True, True, True],
+          str(run["executor_guards"]))
+
+
+def t_signal_decision_rule_is_validated_and_defaults_to_the_old_flag():
+    """An unknown rule fails at import, and existing .env files are unchanged."""
+    bad = _reload_config(SIGNAL_DECISION_RULE="majority")
+    check("an unknown rule is refused",
+          "SIGNAL_DECISION_RULE" in (bad or ""), str(bad))
+    # _reload_config restores the environment before returning, so the value
+    # has to be read while the override is still installed.
+    import importlib
+    import os
+    import config as cfg
+    saved = dict(os.environ)
+    try:
+        for flag, want in (("0", "price"), ("1", "minority")):
+            os.environ["SIGNAL_MINORITY_RULE"] = flag
+            os.environ.pop("SIGNAL_DECISION_RULE", None)
+            importlib.reload(cfg)
+            check(f"SIGNAL_MINORITY_RULE={flag} still means {want!r}",
+                  cfg.SIGNAL_DECISION_RULE == want, cfg.SIGNAL_DECISION_RULE)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        importlib.reload(cfg)
 
 
 async def t_primary_entries_are_price_banded_but_hedge_legs_are_not():

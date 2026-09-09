@@ -352,10 +352,35 @@ PHASE2_PARTIAL_SIGNALS = bool(_env_bool("PHASE2_PARTIAL_SIGNALS", False))
 # picks ONE side, and multi-signal exists to buy several.
 SIGNAL_MINORITY_RULE = bool(_env_bool("SIGNAL_MINORITY_RULE", False))
 
+# WHICH signal actually picks the order side.
+#
+#   "price"    - SIG PRICE alone. BOOK and CHAINLINK stay diagnostics.
+#   "minority" - follow the dissenting signal (strategy.minority_decision).
+#   "final"    - strategy.final_decision, the line the dashboard has always
+#                shown as "diagnostic": PRICE and BOOK agreeing wins; failing
+#                that CHAINLINK breaks the tie by siding with one of them;
+#                failing that, whichever signal is present at all. This is a
+#                CONFIRMATION rule - it trades the side two feeds agree on,
+#                where "price" trades one feed's opinion unconfirmed.
+#
+# main_bot._authority_side is the single place this is read, and every
+# re-validation gate asks it the same question. That matters more than the
+# rule itself: when the chooser and the gates disagree, the gates reject
+# nearly every order the chooser makes.
+#
+# Defaults to the SIGNAL_MINORITY_RULE setting, so an existing .env keeps the
+# behaviour it already had.
+SIGNAL_DECISION_RULE = (
+    _env_text("SIGNAL_DECISION_RULE",
+              "minority" if SIGNAL_MINORITY_RULE else "price") or "").strip().lower()
+if SIGNAL_DECISION_RULE not in {"price", "minority", "final"}:
+    raise ValueError(
+        "SIGNAL_DECISION_RULE must be one of: price, minority, final")
+
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))
 if PHASE2_MULTI_SIGNAL and not PHASE2_ENABLED:
     raise ValueError("PHASE2_MULTI_SIGNAL requires PHASE2_ENABLED=1")
-if SIGNAL_MINORITY_RULE and PHASE2_MULTI_SIGNAL:
+if SIGNAL_DECISION_RULE == "minority" and PHASE2_MULTI_SIGNAL:
     raise ValueError(
         "SIGNAL_MINORITY_RULE selects a single dissenting side; it cannot be "
         "combined with PHASE2_MULTI_SIGNAL, which buys one leg per signal")

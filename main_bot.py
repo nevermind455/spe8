@@ -154,16 +154,15 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
     side.  A missing/stale print, a round rollover, equality, or a flipped
     side all fail closed.
 
-    Under SIGNAL_MINORITY_RULE the order side is chosen by a 3-signal vote
-    (see `_authority_side`), not SIG PRICE alone. When the caller supplies
-    `book_token` and `chainlink_start`, this permit recomputes that same vote
-    from freshly-sampled signals instead of comparing raw SIG PRICE against
-    `expected_side` - otherwise a genuine dissenting order would almost
-    always fail this check (SIG PRICE alone rarely equals the minority pick),
-    and a stale minority pick could slip through whenever SIG PRICE alone
-    happened to coincide with it.  Callers that never pass `book_token`
-    (phase 1 bands, which are price-only by design) keep the SIG-PRICE-only
-    behavior unchanged.
+    Unless SIGNAL_DECISION_RULE is "price", the order side is chosen from all
+    three signals (see `_authority_side`), not SIG PRICE alone. When the
+    caller supplies `book_token` and `chainlink_start`, this permit recomputes
+    that same decision from freshly-sampled signals instead of comparing raw
+    SIG PRICE against `expected_side` - otherwise a genuine order would almost
+    always fail this check (SIG PRICE alone rarely equals the chosen side),
+    and a stale pick could slip through whenever SIG PRICE alone happened to
+    coincide with it.  Callers that never pass `book_token` (phase 1 bands,
+    which are price-only by design) keep the SIG-PRICE-only behavior.
     """
     def reject(reason):
         return polymarket_trade.GuardRejection(reason) if explain else False
@@ -195,7 +194,7 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
                   f"sample belongs to a different round than the order.")
             return reject("price sample belongs to a different round")
         sampled_side = price_signal(round_key, start_price, current_price)
-        if config.SIGNAL_MINORITY_RULE and book_token is not None:
+        if config.SIGNAL_DECISION_RULE != "price" and book_token is not None:
             book_side = None
             try:
                 bids, asks = orderbook.get_orderbook(book_token)
@@ -342,13 +341,24 @@ class _RoundSignalEpoch:
 def _authority_side(price_side, book_side, chainlink_side):
     """The signal that actually decides the order side under this config.
 
-    The round epoch has to track whatever drives execution. Under the minority
-    rule the decision can flip because BOOK or CHAINLINK moved while SIG PRICE
-    stood still, and an epoch watching SIG PRICE alone would call that "no
-    transition" - refusing the very complement the flip was supposed to buy.
+    This is the ONLY implementation of that rule. The phase-2 chooser calls
+    it to pick the side, and the three re-validation gates (final, pre-submit
+    and immediately-before-submit) call it again to confirm the side still
+    holds. That shared identity is load-bearing, not tidiness: when a gate
+    evaluates a different rule from the chooser, it rejects nearly every
+    order the chooser makes - which is exactly what happened when the gates
+    still compared raw SIG PRICE against a minority pick.
+
+    The round epoch also tracks this, because under any rule but "price" the
+    decision can flip because BOOK or CHAINLINK moved while SIG PRICE stood
+    still; an epoch watching SIG PRICE alone would call that "no transition"
+    and refuse the very complement the flip was supposed to buy.
     """
-    if config.SIGNAL_MINORITY_RULE:
+    rule = config.SIGNAL_DECISION_RULE
+    if rule == "minority":
         return strategy.minority_decision(price_side, book_side, chainlink_side)
+    if rule == "final":
+        return strategy.final_decision(price_side, book_side, chainlink_side)
     return price_side
 
 
@@ -1097,7 +1107,7 @@ async def run_bot():
             )
 
             price_side = price_signal(active_window, start_price, lp)
-            if not config.SIGNAL_MINORITY_RULE:
+            if config.SIGNAL_DECISION_RULE == "price":
                 signal_epoch.observe(price_side)
             signal_epoch.initialize_from_durable(held_tokens, up_id, down_id)
             book_side = None
@@ -1117,27 +1127,29 @@ async def run_bot():
                 print(f"{_ts()} [RISK] No order: fresh SIG PRICE is neutral or unavailable.")
                 await asyncio.sleep(0.2)
                 continue
-            # Book and Chainlink remain visible diagnostics.  They may confirm
-            # SIG PRICE, but they can never override the side sent to execution.
+            # Which signal picks the side is SIGNAL_DECISION_RULE's job, and
+            # _authority_side is the single place it is read - the same call
+            # the three re-validation gates below make. Under "price" the
+            # book and Chainlink stay diagnostics and never override SIG
+            # PRICE; under "minority" the order follows whichever side is
+            # outvoted; under "final" it follows the confirmed side (PRICE
+            # and BOOK agreeing, else CHAINLINK siding with one of them).
             #
-            # Under SIGNAL_MINORITY_RULE they DO decide it: the order follows
-            # whichever side is outvoted. The fresh-SIG-PRICE gate above still
-            # runs first, so a stale or neutral price feed refuses the round
-            # either way - only the choice of side moves, never the decision
+            # The fresh-SIG-PRICE gate above still runs first under every
+            # rule, so a stale or neutral price feed refuses the round either
+            # way - only the choice of side moves here, never the decision
             # about whether it is safe to trade at all.
-            if config.SIGNAL_MINORITY_RULE:
-                side = strategy.minority_decision(
-                    price_side, book_side, chainlink_side)
-                # Track the decision, not SIG PRICE: this is what a later flip
-                # has to differ from for the complement to be permitted.
+            side = _authority_side(price_side, book_side, chainlink_side)
+            # Track the decision, not SIG PRICE: this is what a later flip
+            # has to differ from for the complement to be permitted.
+            if config.SIGNAL_DECISION_RULE != "price":
                 signal_epoch.observe(side)
-                if side is None:
-                    print(f"{_ts()} [RISK] No order: signals are tied or "
-                          f"unanimous-neutral, so there is no minority side.")
-                    await asyncio.sleep(0.2)
-                    continue
-            else:
-                side = price_side
+            if side is None:
+                print(f"{_ts()} [RISK] No order: the "
+                      f"{config.SIGNAL_DECISION_RULE} rule names no side "
+                      f"(signals tied or unanimous-neutral).")
+                await asyncio.sleep(0.2)
+                continue
 
             print(
                 f"{_ts()} [SIGNAL] price={price_side} book={book_side or 'n/a'} "
@@ -1306,12 +1318,12 @@ async def run_bot():
                 print(f"{_ts()} [RISK] No order: SIG PRICE became neutral during validation.")
                 await asyncio.sleep(0.2)
                 continue
-            # Compare against the AUTHORITY side, not raw SIG PRICE: under
-            # SIGNAL_MINORITY_RULE `side` is the 3-signal minority vote, and
-            # comparing it to SIG PRICE alone rejects nearly every genuine
-            # dissenting order (SIG PRICE alone rarely equals the minority
-            # pick) while letting a stale minority pick through whenever
-            # SIG PRICE alone happens to coincide with it.
+            # Compare against the AUTHORITY side, not raw SIG PRICE: unless
+            # SIGNAL_DECISION_RULE is "price", `side` was chosen from all
+            # three signals, and comparing it to SIG PRICE alone rejects
+            # nearly every genuine order (SIG PRICE alone rarely equals the
+            # chosen side) while letting a stale pick through whenever SIG
+            # PRICE alone happens to coincide with it.
             if final_authority_side != side:
                 print(
                     f"{_ts()} [RISK] No order: deciding signal changed during "
@@ -1629,7 +1641,7 @@ async def run_bot():
                 continue
             # See the final-validation guard above: compare the AUTHORITY
             # side, not raw SIG PRICE, so this check means the same thing
-            # under SIGNAL_MINORITY_RULE as it does in the default mode.
+            # under every SIGNAL_DECISION_RULE.
             if submit_authority_side != side:
                 print(
                     f"{_ts()} [RISK] No order: deciding signal changed immediately "
