@@ -641,6 +641,7 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     main_bot._paper_broker = None
     main_bot._accounting_enabled = True
     main_bot._round_exposure_provider = None
+    main_bot._unsettled_exposure_provider = None
     main_bot._round_held_tokens_provider = None
     main_bot._execution_ready_provider = None
 
@@ -688,6 +689,9 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
             main_bot, broker, log_path=paper_paths["trade_log"])
         main_bot._round_exposure_provider = (
             lambda _window, condition: ledger.confirmed_cost_for_condition(condition))
+        # Spans every open round, not just this one - see
+        # main_bot._unsettled_exposure_block.
+        main_bot._unsettled_exposure_provider = ledger.unsettled_cost
         main_bot._round_held_tokens_provider = (
             lambda _window, condition: ledger.held_tokens_for_condition(condition))
         # PAPER only. The live ledger tracks authorized orders per window, not
@@ -720,6 +724,10 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         polymarket_trade.set_order_observer(journal_live_order)
         main_bot._round_exposure_provider = (
             lambda window, _condition: ledger.authorized_cost_for_window(window))
+        # Same guard in LIVE, where frozen capital is real money rather than a
+        # modelling detail: a stalled venue resolution ties up funds on a
+        # wallet that cannot be topped up mid-session.
+        main_bot._unsettled_exposure_provider = ledger.unsettled_cost
         main_bot._round_held_tokens_provider = (
             lambda window, _condition: ledger.authorized_tokens_for_window(window))
         # PHASE2_MULTI_SIGNAL runs in LIVE too, and there a complement leg is

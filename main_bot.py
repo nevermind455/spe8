@@ -45,6 +45,9 @@ _accounting_enabled = False
 _FINAL_BOOK_REUSE_SECONDS = 1.0
 
 _round_exposure_provider = None
+# Total cash committed to rounds the venue has not resolved yet, across every
+# open round. Supplied by run_feeds from the ledger; None leaves the guard off.
+_unsettled_exposure_provider = None
 _round_held_tokens_provider = None
 # Returns (entry_price, fee_per_share) for one open leg, or None. Only the
 # pair-lock guard reads it; without it that guard stays closed.
@@ -360,6 +363,35 @@ def _authority_side(price_side, book_side, chainlink_side):
     if rule == "final":
         return strategy.final_decision(price_side, book_side, chainlink_side)
     return price_side
+
+
+def _unsettled_exposure_block() -> str | None:
+    """Why a new entry must not open, or None when it may.
+
+    MAX_ROUND_EXPOSURE bounds one round in isolation, which cannot see the
+    failure that actually empties an account: venue settlement stalling while
+    every new round passes its own budget check. Capital committed to
+    unresolved rounds is neither spendable nor lost - and the bot must not
+    settle those itself, because it would be inventing an outcome the venue
+    has not published. Declining to open more is the only honest lever.
+
+    Fails CLOSED. An exposure figure that cannot be read is a reason to stop
+    adding risk, not to assume there is none.
+    """
+    cap = config.MAX_UNSETTLED_EXPOSURE
+    if not cap or _unsettled_exposure_provider is None:
+        return None
+    try:
+        frozen = float(_unsettled_exposure_provider())
+    except Exception as exc:
+        return (f"unsettled exposure could not be read "
+                f"({type(exc).__name__}); refusing to commit more")
+    if not math.isfinite(frozen):
+        return "unsettled exposure is not a finite number"
+    if frozen >= cap:
+        return (f"${frozen:.2f} is committed to rounds the venue has not "
+                f"resolved yet (cap ${cap:.2f}); waiting for settlement")
+    return None
 
 
 stop_event = threading.Event()
@@ -840,6 +872,11 @@ async def run_bot():
             if round_exposure + entry_ceiling > config.MAX_ROUND_EXPOSURE + 1e-9:
                 await asyncio.sleep(0.2)
                 continue
+            frozen_reason = _unsettled_exposure_block()
+            if frozen_reason:
+                print(f"{_ts()} [RISK] phase1 skip: {frozen_reason}.")
+                await asyncio.sleep(0.2)
+                continue
 
             # Two independent reads of two different tokens, and the band test
             # needs both before it can choose. Run them together: sequentially
@@ -1238,6 +1275,12 @@ async def run_bot():
                                else config.PRIMARY_ENTRY_MAX_PRICE)
             entry_min_price = (config.MIN_BUY_PRICE if is_taper_hedge
                                else config.PRIMARY_ENTRY_MIN_PRICE)
+
+            frozen_reason = _unsettled_exposure_block()
+            if frozen_reason:
+                print(f"{_ts()} [RISK] No order: {frozen_reason}.")
+                await _cooldown()
+                continue
 
             entry_ceiling = config.entry_cost_ceiling(config.MAX_BUY_PRICE)
             if round_exposure + entry_ceiling > config.MAX_ROUND_EXPOSURE + 1e-9:

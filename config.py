@@ -512,6 +512,22 @@ def _round_entry_budget() -> float:
 
 MAX_ROUND_EXPOSURE = _env_float("MAX_ROUND_EXPOSURE", str(_round_entry_budget()))
 
+# Ceiling on cash committed to rounds the venue has not resolved yet, across
+# ALL open rounds. MAX_ROUND_EXPOSURE caps one round in isolation, which is
+# blind to the case that actually empties an account: settlement stalling
+# upstream while every new round passes its own budget check. Observed doing
+# exactly that - 20 open rounds holding 103% of a $300 wallet, leaving $3
+# tradeable, purely because the venue had not written resolutions on chain.
+#
+# The bot cannot settle those itself without inventing an outcome, so the only
+# safe lever is to stop opening new ones. Entries are refused while unsettled
+# cost is at or above this, and resume by themselves as positions settle.
+#
+# 0 disables it, which is the default: this changes nothing until set.
+MAX_UNSETTLED_EXPOSURE = _env_float("MAX_UNSETTLED_EXPOSURE", "0")
+if not math.isfinite(MAX_UNSETTLED_EXPOSURE) or MAX_UNSETTLED_EXPOSURE < 0:
+    raise ValueError("MAX_UNSETTLED_EXPOSURE must be finite and non-negative")
+
 # ---- stop loss --------------------------------------------------------------
 # Sell a held leg once its BID reaches STOP_LOSS_PRICE. This is a client-side
 # trigger, not an order type: the CLOB has only FAK/FOK/GTC/GTD, so nothing

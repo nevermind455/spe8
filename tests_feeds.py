@@ -1646,7 +1646,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # main_bot.py re-approved 2026-09-09: a signal flip re-anchors the taper
     # cycle to the new side but keeps its position. Resetting the count
     # starved the opposite-side slot to 1-in-5.7 fills instead of 1-in-3.
-    "main_bot.py": "0d7c78c1bd65dce762ee752a89cc45d78f3e3a94d6e2f44178cd6cf3a26729a8",
+    # main_bot.py, config.py re-approved 2026-09-09: MAX_UNSETTLED_EXPOSURE,
+    # a cap on cash committed to rounds the venue has not resolved. Default 0
+    # (off). Per-round exposure could not see a settlement stall freezing 103%
+    # of a wallet across 20 open rounds.
+    "main_bot.py": "972eea7ab80acda3f9692325381b0fe4c07bf9e4268b1236145d3df8ec703b1c",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
@@ -1654,7 +1658,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "993040e0dc15d1e8521e232cc3b6ead51a2fdb8368c36441d22f5d6267917c0e",
+    "config.py": "01eb629c44fbeffbe8a2736f2b8278cba2482402def1192c544bf44b6a14bfc2",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

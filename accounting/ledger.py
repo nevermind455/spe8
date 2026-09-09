@@ -259,6 +259,24 @@ class Ledger:
                 raise RuntimeError("confirmed all-in exposure is invalid")
             return total
 
+    def unsettled_cost(self) -> float:
+        """Cash committed to positions the venue has not resolved yet.
+
+        This is capital that is neither spendable nor lost - it returns in
+        full at settlement, or converts to a payout. It spans every open
+        round, which is exactly what per-round exposure cannot see: when
+        venue resolution stalls, each new round passes its own budget check
+        while the total frozen across rounds keeps climbing. Observed doing
+        precisely that - 20 open rounds holding 103% of a $300 wallet while
+        settlement was backed up upstream.
+        """
+        with self._lock:
+            total = sum(position.cost for position in self.positions.values()
+                        if not position.settled and position.shares > 0)
+        if not math.isfinite(total) or total < 0:
+            raise RuntimeError("unsettled exposure is invalid")
+        return float(total)
+
     def held_tokens_for_condition(self, condition_id: str | None) -> frozenset[str]:
         """Unsettled paper inventory legs for one discovered condition."""
         condition = str(condition_id or "")

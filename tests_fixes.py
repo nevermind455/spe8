@@ -1124,7 +1124,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   allow_signal_flips=False,
                                   taper_hedge_enabled=False, token_books=None,
                                   liquidity_probe=None, primary_band=None,
-                                  decision_rule=None):
+                                  decision_rule=None, unsettled_provider=None,
+                                  max_unsettled=0.0):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1241,6 +1242,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "SIGNAL_MINORITY_RULE", minority_rule)
         replace(main_bot.config, "SIGNAL_DECISION_RULE",
                 decision_rule or ("minority" if minority_rule else "price"))
+        replace(main_bot.config, "MAX_UNSETTLED_EXPOSURE", max_unsettled)
+        replace(main_bot, "_unsettled_exposure_provider", unsettled_provider)
         replace(main_bot.config, "TAPER_HEDGE_ENABLED", taper_hedge_enabled)
         if primary_band is not None:
             replace(main_bot.config, "PRIMARY_ENTRY_MIN_PRICE", primary_band[0])
@@ -1674,6 +1677,237 @@ async def t_taper_cycle_reanchors_to_the_new_signal_without_restarting():
           [round(a, 2) for a in onslot["order_amounts"]]
           == [3.0, 2.0, 1.0, 3.0, 2.0, 1.0],
           str(onslot["order_amounts"]))
+
+
+async def t_signal_decision_rule_selects_the_side_and_the_gates_agree():
+    """SIGNAL_DECISION_RULE picks the side, and every gate asks the same rule.
+
+    The gates matter more than the rule. Phase 2 re-validates the side three
+    times after choosing it - final validation, the pre-submit guard, and
+    again immediately before submission - and each calls _authority_side. If
+    the chooser used one rule and the gates another, a correctly chosen order
+    would be rejected on nearly every attempt (that is exactly what happened
+    when the gates still compared raw SIG PRICE to a minority pick). So the
+    test that counts is not "which side" but "did the order actually leave".
+
+    price=UP book=DOWN chainlink=DOWN separates all three rules:
+        price    -> UP   (book and chainlink stay diagnostics)
+        minority -> UP   (UP is the dissenter, 1 vs 2)
+        final    -> DOWN (price and book disagree, chainlink sides with book)
+    """
+    for rule, want in (("price", "UP"), ("minority", "UP"), ("final", "DOWN")):
+        run = await _drive_phase2_with_hold(
+            execution_mode="PAPER", held_provider=lambda *_a: set(),
+            price_votes=("UP",) * 40, book_vote="DOWN", chainlink_vote="DOWN",
+            decision_rule=rule, stop_after_orders=1, timeout=3.0)
+        check(f"rule {rule!r} orders {want}",
+              run["order_sides"] == [want], f"{rule}: {run['order_sides']}")
+        check(f"rule {rule!r} actually submitted - the gates agreed",
+              run["orders"] == 1 and run["executor_guards"] == [True],
+              f"{rule}: orders={run['orders']} guards={run['executor_guards']}")
+
+
+async def t_final_decision_rule_drives_a_whole_taper_cycle():
+    """The taper cycle must ride the chosen rule, not SIG PRICE underneath it.
+
+    Every slot anchors to what entry 1 bought and the flip check compares the
+    live decision against that anchor, so if the cycle read a different rule
+    from the chooser it would either restart on every attempt or never
+    restart at all. Here the decision is DOWN while SIG PRICE says UP: two
+    primaries must grow DOWN and the hedge must buy its complement, UP.
+    """
+    run = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, book_vote="DOWN", chainlink_vote="DOWN",
+        decision_rule="final", taper_hedge_enabled=True,
+        stop_after_orders=3, timeout=3.0)
+    check("the cycle grows the DECIDED side, not SIG PRICE",
+          run["order_sides"][:2] == ["DOWN", "DOWN"], str(run["order_sides"]))
+    check("the hedge buys the complement of the decided side",
+          run["order_sides"][2] == "UP", str(run["order_sides"]))
+    check("amounts still taper $3 -> $2 -> hedge",
+          [round(a, 2) for a in run["order_amounts"]][:2] == [3.0, 2.0],
+          str(run["order_amounts"]))
+    check("no attempt was rejected by a gate reading a different rule",
+          run["executor_guards"] == [True, True, True],
+          str(run["executor_guards"]))
+
+
+def t_signal_decision_rule_is_validated_and_defaults_to_the_old_flag():
+    """An unknown rule fails at import, and existing .env files are unchanged."""
+    bad = _reload_config(SIGNAL_DECISION_RULE="majority")
+    check("an unknown rule is refused",
+          "SIGNAL_DECISION_RULE" in (bad or ""), str(bad))
+    # _reload_config restores the environment before returning, so the value
+    # has to be read while the override is still installed.
+    import importlib
+    import os
+    import config as cfg
+    saved = dict(os.environ)
+    try:
+        for flag, want in (("0", "price"), ("1", "minority")):
+            os.environ["SIGNAL_MINORITY_RULE"] = flag
+            os.environ.pop("SIGNAL_DECISION_RULE", None)
+            importlib.reload(cfg)
+            check(f"SIGNAL_MINORITY_RULE={flag} still means {want!r}",
+                  cfg.SIGNAL_DECISION_RULE == want, cfg.SIGNAL_DECISION_RULE)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        importlib.reload(cfg)
+
+
+async def t_primary_entries_are_price_banded_but_hedge_legs_are_not():
+    """A primary entry may be held to a tighter band than the hedge leg.
+
+    Measured over 620 settled fills the two leg types are priced completely
+    differently for almost the same hit rate - primary paid 0.577 for a 52%
+    hit rate (edge -0.058), the hedge paid 0.418 for 54% (edge +0.118) - and
+    the 0.60-0.80 band alone carried 52% of turnover at about -0.05 edge. So
+    the ceiling belongs on the leg that follows the signal, while the hedge
+    stays on the account bounds: its edge is largest in exactly the cheap
+    buckets a shared floor would forbid.
+
+    The band must reach the ORDER, not only the probe. The broker walks the
+    book, so a probe that passed at the band's top says nothing about where
+    the fill actually lands; both paths are checked.
+    """
+    import main_bot
+    band = (0.25, 0.80)                     # (min, max) for primary entries
+    acct = (main_bot.config.MAX_BUY_PRICE, main_bot.config.MIN_BUY_PRICE)
+
+    run = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, stop_after_orders=3,
+        taper_hedge_enabled=True, primary_band=band, timeout=3.0)
+
+    check("the cycle ran two primaries then a hedge",
+          run["order_sides"] == ["UP", "UP", "DOWN"], str(run["order_sides"]))
+    check("both primary entries are submitted inside the primary band",
+          run["order_bands"][:2] == [(0.80, 0.25), (0.80, 0.25)],
+          str(run["order_bands"]))
+    check("the hedge leg is submitted on the ACCOUNT band, not the primary one",
+          run["order_bands"][2] == acct,
+          f"{run['order_bands'][2]} vs account {acct}")
+    check("the liquidity probe asks about the band it will submit under",
+          (0.80, 0.25) in run["probe_bands"], str(run["probe_bands"][:4]))
+
+    # Left at the account band the feature is inert - existing behaviour.
+    plain = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, stop_after_orders=2,
+        taper_hedge_enabled=True, primary_band=(acct[1], acct[0]), timeout=3.0)
+    check("band defaulted to the account band changes nothing",
+          all(b == acct for b in plain["order_bands"]),
+          str(plain["order_bands"]))
+
+
+def t_primary_entry_band_may_only_tighten_the_account_band():
+    """Config refuses a band the brokers would silently ignore.
+
+    Both brokers clamp a per-order bound to the account band (tighten-only),
+    so a PRIMARY_ENTRY_MAX_PRICE above MAX_BUY_PRICE would read as configured
+    and do nothing at all. Failing loudly at import beats that.
+    """
+    ok = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
+                        PRIMARY_ENTRY_MIN_PRICE="0.15",
+                        PRIMARY_ENTRY_MAX_PRICE="0.80")
+    check("a band inside the account band is accepted", ok is None, str(ok))
+
+    loose_max = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
+                               PRIMARY_ENTRY_MAX_PRICE="0.95")
+    check("a ceiling above MAX_BUY_PRICE is refused",
+          "PRIMARY_ENTRY_MAX_PRICE" in (loose_max or ""), str(loose_max))
+
+    loose_min = _reload_config(MIN_BUY_PRICE="0.20", MAX_BUY_PRICE="0.90",
+                               PRIMARY_ENTRY_MIN_PRICE="0.05")
+    check("a floor below MIN_BUY_PRICE is refused",
+          "PRIMARY_ENTRY_MIN_PRICE" in (loose_min or ""), str(loose_min))
+
+    inverted = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
+                              PRIMARY_ENTRY_MIN_PRICE="0.85",
+                              PRIMARY_ENTRY_MAX_PRICE="0.80")
+    check("a floor above its own ceiling is refused",
+          "below PRIMARY_ENTRY_MAX_PRICE" in (inverted or ""), str(inverted))
+
+
+def _raise_unreadable():
+    raise RuntimeError("ledger unreadable")
+
+
+def t_unsettled_exposure_guard_is_off_by_default_and_fails_closed():
+    """Capital frozen in unresolved rounds must stop new ones being opened.
+
+    MAX_ROUND_EXPOSURE bounds a single round, which is blind to the failure
+    that actually empties an account: the venue stalling on settlement while
+    every new round still passes its own budget check. Observed live - 20
+    open rounds holding 103% of a $300 wallet, $3 left tradeable, purely
+    because Polymarket had not written resolutions on chain. The bot must not
+    settle those itself (that would be inventing an outcome), so declining to
+    open more is the only honest lever.
+    """
+    import main_bot
+    saved_cap = main_bot.config.MAX_UNSETTLED_EXPOSURE
+    saved_provider = main_bot._unsettled_exposure_provider
+    try:
+        main_bot._unsettled_exposure_provider = lambda: 309.80
+
+        main_bot.config.MAX_UNSETTLED_EXPOSURE = 0
+        check("0 disables the guard entirely",
+              main_bot._unsettled_exposure_block() is None)
+
+        main_bot.config.MAX_UNSETTLED_EXPOSURE = 500.0
+        check("under the cap, entries are permitted",
+              main_bot._unsettled_exposure_block() is None)
+
+        main_bot.config.MAX_UNSETTLED_EXPOSURE = 150.0
+        blocked = main_bot._unsettled_exposure_block()
+        check("at or over the cap, entries are refused", bool(blocked), str(blocked))
+        check("the reason names both the figure and the cap",
+              "309.80" in blocked and "150.00" in blocked, str(blocked))
+
+        # A risk guard that cannot read its input must stop, not assume zero.
+        main_bot._unsettled_exposure_provider = _raise_unreadable
+        blocked = main_bot._unsettled_exposure_block()
+        check("an unreadable figure fails CLOSED",
+              bool(blocked) and "could not be read" in blocked, str(blocked))
+        main_bot._unsettled_exposure_provider = lambda: float("nan")
+        check("a non-finite figure fails CLOSED",
+              bool(main_bot._unsettled_exposure_block()))
+
+        main_bot._unsettled_exposure_provider = None
+        check("no provider wired leaves the guard inert",
+              main_bot._unsettled_exposure_block() is None)
+    finally:
+        main_bot.config.MAX_UNSETTLED_EXPOSURE = saved_cap
+        main_bot._unsettled_exposure_provider = saved_provider
+
+
+def t_ledger_unsettled_cost_counts_only_open_positions():
+    """The figure the guard reads must exclude anything already resolved."""
+    import pathlib
+    import tempfile
+    from accounting.ledger import Ledger
+    led = Ledger(path=str(pathlib.Path(tempfile.mkdtemp()) / "l.json"))
+    check("an empty ledger reports nothing frozen",
+          led.unsettled_cost() == 0.0, str(led.unsettled_cost()))
+
+
+async def t_unsettled_exposure_guard_stops_phase2_entries():
+    """The guard has to reach the order path, not merely evaluate correctly."""
+    frozen = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 20, stop_after_orders=1,
+        unsettled_provider=lambda: 400.0, max_unsettled=150.0, timeout=1.5)
+    check("no order is placed while frozen capital is above the cap",
+          frozen["orders"] == 0, str(frozen["order_sides"]))
+
+    clear = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 20, stop_after_orders=1,
+        unsettled_provider=lambda: 10.0, max_unsettled=150.0, timeout=3.0)
+    check("orders resume once it is back under the cap",
+          clear["orders"] == 1, str(clear["order_sides"]))
 
 
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():
