@@ -198,6 +198,26 @@ def _trade_success(result) -> bool:
     return outcome not in {"", "rejected_or_unsubmitted", "failed", "rejected"}
 
 
+def _trade_sent(result) -> bool:
+    """Did this journal row ever reach submission?
+
+    BUGFIX: a `skipped_*` row is an attempt the bot deliberately did NOT
+    submit - the leg was unfillable, the signal moved, or the pair would
+    lose. It never reached the broker, so it is neither a successful send nor
+    a failed one, but every counter here derived failures as "not a success"
+    (`len(trades) - oks`) and so booked it as a failed SEND. One skipped
+    phase-2 attempt rendered as `SENT FAIL 1 50%` in SIGNAL DISTRIBUTION
+    beside `ORDERS OK/FAIL 1 / 0` and `SEND RATE 100%` in the cash panel,
+    which reads as a dashboard contradiction; the trade and band logs marked
+    the same row a red `REJECT`, indistinguishable from a venue refusal.
+
+    `rejected_or_unsubmitted` deliberately stays a failed SEND. Its name
+    spans both cases and the row alone cannot separate them, so it keeps the
+    bucket it has always had rather than being silently reclassified.
+    """
+    return not str(result or "").lower().startswith("skipped")
+
+
 # ------------------------------------------------------------------ pieces ---
 def _header(snap, cols: int, g: Glyphs, s: Sizing) -> Row:
     clk = time.strftime("%H:%M:%S", time.localtime(snap["now"]))
@@ -679,12 +699,27 @@ def _dist(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     trades = snap["trades"]
     ups = sum(1 for t in trades if str(t.get("side")).upper() == "UP")
     dns = sum(1 for t in trades if str(t.get("side")).upper() == "DOWN")
-    oks = sum(1 for t in trades if _trade_success(t.get("result")))
-    fails = len(trades) - oks
+    # Only rows that actually reached submission belong in the SENT bars;
+    # see _trade_sent. A skip still counts as a DECIDE, so DECIDE and SENT
+    # now legitimately disagree whenever the bot declined to send - which is
+    # the real shape of the round, and what the cash panel has always shown.
+    sent_rows = [t for t in trades if _trade_sent(t.get("result"))]
+    oks = sum(1 for t in sent_rows if _trade_success(t.get("result")))
+    fails = len(sent_rows) - oks
+    skipped = len(trades) - len(sent_rows)
     decided, sent = ups + dns, oks + fails
-    body = histogram([("DECIDE UP", ups), ("DECIDE DOWN", dns),
-                      ("SENT OK", oks), ("SENT FAIL", fails)], w, 4, g,
-                     totals=[decided, decided, sent, sent])
+    buckets = [("DECIDE UP", ups), ("DECIDE DOWN", dns),
+               ("SENT OK", oks), ("SENT FAIL", fails)]
+    totals = [decided, decided, sent, sent]
+    if skipped:
+        # Carried as its own bar rather than the panel note: at this panel's
+        # width the note is already truncated mid-string by panel(), so a
+        # count parked there would not survive to the screen. Added only when
+        # there is something to report, so a round with no skips lays out
+        # exactly as before and the extra row costs nothing.
+        buckets.append(("NOT SENT", skipped))
+        totals.append(len(trades))
+    body = histogram(buckets, w, len(buckets), g, totals=totals)
     body.append([(g.h * w, RULE)])
     pb = sum(1 for t in trades if t.get("price_side") and t.get("price_side") == t.get("book_side"))
     body.append(kv("PRICE=BOOK AGREE", f"{pb}/{len(trades)}" if trades else MISSING, w,
@@ -713,6 +748,8 @@ def _trades(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     rows_data = []
     for t in reversed(snap["trades"][-40:]):
         ok = _trade_success(t.get("result"))
+        # A row the bot never submitted is not a rejection - see _trade_sent.
+        was_sent = _trade_sent(t.get("result"))
         cells = [
             (str(t.get("time_et", ""))[-11:-3] or "--", DIM),
             (str(t.get("side", "--")), Style("green" if t.get("side") == "UP" else "red", bold=True)),
@@ -720,8 +757,10 @@ def _trades(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
             (str(t.get("price_side") or "-")[:2], FAINT),
             (str(t.get("book_side") or "-")[:2], FAINT),
             (str(t.get("chainlink_side") or "-")[:2], FAINT),
-            (("FILL" if snap["mode"] == "PAPER" else "SENT") if ok else "REJECT",
-             Style("green" if ok else "red", bold=True)),
+            (("FILL" if snap["mode"] == "PAPER" else "SENT") if ok
+             else ("REJECT" if was_sent else "SKIP"),
+             Style("green" if ok else ("red" if was_sent else "amber"),
+                   bold=True)),
             (MISSING, FAINT),
         ]
         rows_data.append([cells[i] for i in idx])
@@ -772,14 +811,18 @@ def _band_trades(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
         if str(t.get("phase") or "") != "phase1":
             continue
         ok = _trade_success(t.get("result"))
+        # A row the bot never submitted is not a rejection - see _trade_sent.
+        was_sent = _trade_sent(t.get("result"))
         cells = [
             (str(t.get("time_et", ""))[-11:-3] or "--", DIM),
             (str(t.get("side", "--")),
              Style("green" if t.get("side") == "UP" else "red", bold=True)),
             (f"${(_finite(t.get('amount')) or 0.0):.2f}", Style("ink")),
             (str(t.get("price_side") or "-")[:2], FAINT),
-            (("FILL" if snap["mode"] == "PAPER" else "SENT") if ok else "REJECT",
-             Style("green" if ok else "red", bold=True)),
+            (("FILL" if snap["mode"] == "PAPER" else "SENT") if ok
+             else ("REJECT" if was_sent else "SKIP"),
+             Style("green" if ok else ("red" if was_sent else "amber"),
+                   bold=True)),
         ]
         rows_data.append(cells[:len(hdr)])
     used = len(body)
@@ -787,6 +830,245 @@ def _band_trades(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
     note = (f"{bands[0][2]:.2f}-{bands[0][3]:.2f} | band only"
             if bands and snap.get("bands_enabled") else "off")
     return panel("BAND TRADES", body, cols, rows, g, right_note=note)
+
+
+def _positions(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
+    """What this round holds per side, at what average, and what it is worth.
+
+    Takes the band log's slot in the default layout. PHASE1_ENABLED=0 is
+    this repo's default, so that panel spent every frame saying bands are
+    off, while the thing a paper run most needs on screen - the position
+    itself - was either split across other panels (ROUND / POSITION shows a
+    single leg, STAKE / PNL shows only account totals) or not shown at all.
+    The band log is not gone: it reclaims this slot whenever bands are on.
+
+    Every figure here is one the ledger already computed for this frame in
+    Ledger.summary(mark=...) - shares, average_entry_price, cost, mark_bid
+    and unrealized_to_bid per open position - so this panel re-derives
+    nothing and cannot drift from STAKE / PNL. A leg the book cannot mark
+    shows the missing marker rather than a zero, the same rule the rest of
+    the dashboard follows.
+    """
+    w = cols - 2
+    acct = snap.get("accounting") or {}
+    details = [d for d in (acct.get("open_position_details") or ())
+               if isinstance(d, Mapping)]
+    tokens = snap.get("tokens") or {}
+    up_id = str(tokens.get("up_token_id") or "")
+    down_id = str(tokens.get("down_token_id") or "")
+
+    def leg(token_id: str) -> dict | None:
+        held = [d for d in details if str(d.get("token_id")) == token_id]
+        if not token_id or not held:
+            return None
+        shares = sum(_finite(d.get("shares")) or 0.0 for d in held)
+        cost = sum(_finite(d.get("cost")) or 0.0 for d in held)
+        # Share-weighted, so several fills at different prices read as the
+        # one average the position was actually built at - which is the
+        # number that decides whether the current bid is a profit.
+        priced = [(_finite(d.get("shares")) or 0.0,
+                   _finite(d.get("average_entry_price"))) for d in held]
+        avg = (sum(n * pr for n, pr in priced) / shares
+               if shares and all(pr is not None for _, pr in priced) else None)
+        bid = next((b for b in (_finite(d.get("mark_bid")) for d in held)
+                    if b is not None), None)
+        marks = [_finite(d.get("unrealized_to_bid")) for d in held]
+        pnl = (sum(marks) if marks and all(m is not None for m in marks)
+               else None)
+        return {"shares": shares, "cost": cost, "avg": avg, "bid": bid,
+                "value": None if bid is None else shares * bid, "pnl": pnl}
+
+    legs = [("UP", leg(up_id)), ("DOWN", leg(down_id))]
+
+    all_hdr = ["SIDE", "SHARES", "AVG", "COST", "BID", "VALUE", "PNL"]
+    all_cw = [4, 7, 5, 7, 5, 7, 7]
+    # Same adaptive trim the trade and matrix tables use, ordered by what can
+    # be recovered elsewhere. BID and VALUE go first: PNL is derived from the
+    # bid, and MARKET MATRIX prints both sides' live bid and ask. AVG and
+    # COST go next - either can be reconstructed from the other plus SHARES.
+    # SHARES is never dropped: it is the one figure in this row that appears
+    # nowhere else on the dashboard, and shedding it to make room for COST
+    # (which is what the first version of this column did) traded away the
+    # more load-bearing number.
+    keep = list(all_hdr)
+    for drop in ("VALUE", "BID", "COST", "AVG"):
+        if sum(all_cw[all_hdr.index(h)] + 1 for h in keep) <= w:
+            break
+        keep.remove(drop)
+    hdr = keep
+    cw = [all_cw[all_hdr.index(h)] for h in keep]
+    idx = [all_hdr.index(h) for h in keep]
+
+    def num(value, spec: str) -> str:
+        v = _finite(value)
+        return spec.format(v) if v is not None else MISSING
+
+    def money(value, signed: bool = False) -> str:
+        """Two decimals while they fit, whole dollars once they do not.
+
+        A 7-wide cell truncates "$-100.00" to "$-100.0", which reads as a
+        different number rather than as a clipped one. Dropping the cents
+        past $99.99 keeps every figure honest at every width.
+        """
+        v = _finite(value)
+        if v is None:
+            return MISSING
+        spec = f"{{:{'+' if signed else ''},.{0 if abs(v) >= 100 else 2}f}}"
+        return "$" + spec.format(v)
+
+    rows_data = []
+    for name, held in legs:
+        side_style = Style("green" if name == "UP" else "red", bold=True)
+        if held is None:
+            cells = [(name, side_style)] + [(MISSING, FAINT)] * 6
+        else:
+            cells = [
+                (name, side_style),
+                (num(held["shares"], "{:.3f}"), Style("ink")),
+                (num(held["avg"], "{:.3f}"), Style("ink")),
+                # Running total for this side, not the last fill: what the
+                # leg has cost so far, fees in, alongside the average it was
+                # built at. Both move on every fill.
+                (money(held["cost"]), Style("ink")),
+                (num(held["bid"], "{:.3f}"), Style("blue")),
+                (money(held["value"]), Style("ink")),
+                (money(held["pnl"], signed=True), pnl_style(held["pnl"])),
+            ]
+        rows_data.append([cells[i] for i in idx])
+    body = table(hdr, cw, rows_data, w, max_rows=2)
+
+    open_legs = [held for _, held in legs if held]
+    values = [held["value"] for held in open_legs]
+    marks = [held["pnl"] for held in open_legs]
+    round_cost = sum(held["cost"] for held in open_legs) if open_legs else None
+    round_value = (sum(values) if values and all(v is not None for v in values)
+                   else None)
+    round_pnl = (sum(marks) if marks and all(m is not None for m in marks)
+                 else None)
+    realized = _finite(acct.get("realized_pnl"))
+    total = _finite(acct.get("total_pnl", acct.get("equity_pnl")))
+
+    shares_total = sum(held["shares"] for held in open_legs) if open_legs else None
+    up_leg, down_leg = legs[0][1], legs[1][1]
+    both = " / ".join(
+        f"{(h['shares'] if h else 0.0):,.3f}" for h in (up_leg, down_leg))
+    # The label shortens rather than letting kv() ellipsise the value: the
+    # numbers are the point of the row, the wording is not.
+    both_label = "UP / DOWN SHARES" if w >= 32 else "UP / DN SH"
+    footer = [
+        ("shares", kv(both_label, both if open_legs else MISSING, w,
+                      Style("ink") if open_legs else FAINT)),
+        ("total_shares", kv("TOTAL SHARES",
+                            f"{shares_total:,.3f}" if shares_total is not None
+                            else MISSING, w,
+                            Style("ink") if shares_total is not None else FAINT)),
+        ("cost", kv("ROUND COST",
+                    f"${round_cost:,.2f}" if round_cost is not None else MISSING,
+                    w, Style("ink") if round_cost is not None else FAINT)),
+        ("value", kv("ROUND VALUE (BID)",
+                     f"${round_value:,.2f}" if round_value is not None else MISSING,
+                     w, Style("ink") if round_value is not None else FAINT)),
+        ("round", kv("ROUND PNL",
+                     f"${round_pnl:+,.2f}" if round_pnl is not None else MISSING,
+                     w, pnl_style(round_pnl))),
+        ("realized", kv("REALIZED",
+                        f"${realized:+,.2f}" if realized is not None else MISSING,
+                        w, pnl_style(realized))),
+        ("total", kv("TOTAL PNL",
+                     f"${total:+,.2f}" if total is not None else MISSING,
+                     w, pnl_style(total))),
+    ]
+    # panel() truncates its body silently, which would eat whichever rows sit
+    # last - so shed the most derivable lines first and keep the P&L that
+    # cannot be reconstructed by eye from the two rows above.
+    avail = (rows - 2) - len(body)
+    if avail >= 2:
+        body.append([(g.h * w, RULE)])
+        avail -= 1
+        for name in ("value", "total_shares", "cost", "realized"):
+            if len(footer) <= avail:
+                break
+            footer = [f for f in footer if f[0] != name]
+        body += [row for _, row in footer[:avail]]
+
+    # Positions on tokens that are not this round's legs are still real money
+    # - a previous round settles ~85s after it ends - so say so rather than
+    # letting this panel read as the whole book.
+    others = sum(1 for d in details
+                 if str(d.get("token_id")) not in (up_id, down_id))
+    note = "mark to bid" + (f" | +{others} settling" if others else "")
+    return panel("POSITIONS", body, cols, rows, g, right_note=note)
+
+
+def _holdings_or_bands(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
+    """One slot, whichever of the two is actually in play.
+
+    Bands own it while PHASE1 is on, because then the band log is the record
+    of what that phase did. Otherwise it shows the live position, which is
+    what the default (phase-2 only) profile needs and which the band panel
+    could only ever report as switched off.
+    """
+    return (_band_trades(snap, cols, rows, g, s) if snap.get("bands_enabled")
+            else _positions(snap, cols, rows, g, s))
+
+
+def _stop_panel(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
+    """What the stop loss is watching, and what it has sold.
+
+    `state.exits`/`state.stop_status` are populated every frame by
+    run_feeds._dashboard_inner and copied into the snapshot, but until now no
+    panel read either key: an operator running with STOP_LOSS_ENABLED=1 had
+    zero visibility into what the stop was watching or had done, despite the
+    full ledger-to-UI pipeline already being wired end to end.
+    """
+    w = cols - 2
+    status = snap.get("stop_status") or {}
+    body: list[Row] = []
+    if not status.get("enabled"):
+        body.append(pad([(fit("stop loss is OFF (STOP_LOSS_ENABLED=0)", w, "<"), FAINT)], w))
+    else:
+        armed = bool(status.get("armed"))
+        body.append(kv("STATUS", "ARMED" if armed else "watching", w,
+                       Style("amber", bold=True) if armed else FAINT))
+        trigger, floor = status.get("trigger"), status.get("floor")
+        body.append(kv(
+            "TRIGGER / FLOOR",
+            f"{trigger:.3f} / {floor:.3f}"
+            if trigger is not None and floor is not None else MISSING,
+            w, Style("ink")))
+        held = status.get("held") or []
+        if not held:
+            body.append(pad([(fit("no legs currently held", w, "<"), FAINT)], w))
+        else:
+            for leg in held[:3]:
+                bid = leg.get("bid")
+                shares = _finite(leg.get("shares")) or 0.0
+                value = (f"{shares:.2f} sh @ bid {bid:.3f}" if bid is not None
+                         else f"{shares:.2f} sh @ bid --")
+                body.append(kv(
+                    f"HELD {leg.get('side', '--')}", value, w,
+                    Style("green" if leg.get("side") == "UP" else "red")))
+    body.append(pad([(fit("", w, "<"), PAPER)], w))
+
+    hdr = ["TIME", "SIDE", "SHARES", "PRICE", "PROCEEDS"]
+    cw = [8, 5, 7, 6, 8]
+    while sum(cw) + len(cw) > w and len(hdr) > 2:
+        hdr.pop()
+        cw.pop()
+    rows_data = []
+    for e in reversed(list(snap.get("exits") or [])):
+        cells = [
+            (str(e.get("time", "")), DIM),
+            (str(e.get("side", "--")),
+             Style("green" if e.get("side") == "UP" else "red", bold=True)),
+            (f"{(_finite(e.get('shares')) or 0.0):.2f}", Style("ink")),
+            (f"{(_finite(e.get('price')) or 0.0):.3f}", FAINT),
+            (f"${(_finite(e.get('proceeds')) or 0.0):.2f}", Style("ink")),
+        ]
+        rows_data.append(cells[:len(hdr)])
+    used = len(body)
+    body += table(hdr, cw, rows_data, w, max_rows=max(1, rows - 3 - used))
+    return panel("STOP LOSS", body, cols, rows, g, right_note="watch + exits")
 
 
 def _events(snap, cols: int, rows: int, g: Glyphs, s: Sizing) -> list[Row]:
@@ -909,21 +1191,33 @@ def build(snap: dict, cols: int, rows: int, g: Glyphs) -> list[Row]:
             frame += join([_trades(snap, w1, s.bot, g, s), _events(snap, w2, s.bot, g, s)],
                           [w1, w2], s.bot)
         elif cols >= 120:
-            w1, w2, w3, w4 = hsplit(cols, [0.20, 0.26, 0.26, 0.28],
+            # The stop panel displaces the P&L histogram only while the stop
+            # loss is actually in play - a summary you can read after the
+            # fact matters less than an unfilled stop you need to see while
+            # it is happening, but there is nothing to show when the feature
+            # is off and STOP_LOSS_ENABLED=0 is this repo's default.
+            stop_active = bool((snap.get("stop_status") or {}).get("enabled"))
+            # POSITIONS (w3) carries five numbers per side; the trade and
+            # event feeds either side are logs that simply show fewer rows
+            # when squeezed, so the width is taken from them.
+            w1, w2, w3, w4 = hsplit(cols, [0.20, 0.23, 0.31, 0.26],
                                     [26, 28, 28, 28])
-            frame += join([_dist(snap, w1, s.bot, g, s),
+            first = (_stop_panel(snap, w1, s.bot, g, s) if stop_active
+                     else _dist(snap, w1, s.bot, g, s))
+            frame += join([first,
                            _trades(snap, w2, s.bot, g, s),
-                           _band_trades(snap, w3, s.bot, g, s),
+                           _holdings_or_bands(snap, w3, s.bot, g, s),
                            _events(snap, w4, s.bot, g, s)],
                           [w1, w2, w3, w4], s.bot)
         else:
-            # Narrower than four columns: the exit panel displaces the P&L
-            # histogram rather than the trade or event feeds. A distribution
-            # is a summary you can read after the fact; an unfilled stop is
-            # something you need to see while it is happening.
+            # Narrower than four columns: the exit/stop panel, when active,
+            # displaces the band log rather than the trade or event feeds.
+            stop_active = bool((snap.get("stop_status") or {}).get("enabled"))
             w1, w2, w3 = hsplit(cols, [0.30, 0.30, 0.40], [28, 28, 30])
+            third = (_stop_panel(snap, w2, s.bot, g, s) if stop_active
+                     else _holdings_or_bands(snap, w2, s.bot, g, s))
             frame += join([_trades(snap, w1, s.bot, g, s),
-                           _band_trades(snap, w2, s.bot, g, s),
+                           third,
                            _events(snap, w3, s.bot, g, s)], [w1, w2, w3], s.bot)
 
     frame.append(_footer(snap, cols, g, s))

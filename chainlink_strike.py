@@ -198,8 +198,9 @@ class ChainlinkStrike:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.last_error = f"{type(exc).__name__}: {exc}"[:160]
-                self._event(self.last_error, "bad")
+                if not getattr(exc, "_chainlink_reported", False):
+                    self.last_error = f"{type(exc).__name__}: {exc}"[:160]
+                    self._event(self.last_error, "bad")
             if self._stop.is_set():
                 break
             self.reconnects += 1
@@ -248,6 +249,27 @@ class ChainlinkStrike:
                 while not self._stop.is_set():
                     raw = await asyncio.wait_for(ws.recv(), timeout=30)
                     self._handle(raw)
+            except websockets.exceptions.ConnectionClosed as exc:
+                # The protocol-level ping/pong keepalive (ping_interval /
+                # ping_timeout above) detects a dead socket for us, including
+                # a half-open one where our own sends fail silently - but
+                # without this, that just looked like every other closure in
+                # the logs. Recording the close code/reason here is what the
+                # old application-level heartbeat's distinct "heartbeat send
+                # failed" / "heartbeat close failed" messages used to give:
+                # a keepalive timeout (no PONG in time) is now told apart
+                # from a normal server-initiated close.
+                self.last_error = (
+                    f"RTDS connection closed: code={exc.code} "
+                    f"reason={exc.reason or '(none)'}")[:160]
+                self._event(self.last_error, "warn")
+                # Still re-raised, so _run()'s backoff (it only resets delay
+                # on a clean return from _session()) is unaffected - just
+                # tagged so _run()'s generic handler does not immediately
+                # overwrite this more specific message with a duplicate,
+                # less informative one.
+                exc._chainlink_reported = True
+                raise
             finally:
                 self._connection_window = None
                 self.connected = False

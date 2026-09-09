@@ -10,7 +10,7 @@ coroutine, the same price_ws.stream_price(), the same decisions. This file
 adds three things and nothing else — read-only probes, a stdout sink, and a
 render task.
 
-Keys:  Ctrl+C quit   r force repaint
+Keys:  Ctrl+C or q quit   r force repaint
 """
 from __future__ import annotations
 
@@ -153,6 +153,14 @@ async def render_loop(state: TerminalState, stop: threading.Event, keys: Keys,
             for ch in keys.pop():
                 if ch in ("r", "R", "\x0c"):
                     renderer.repaint()
+                elif ch in ("q", "Q", "\x03"):
+                    # A software-level quit independent of OS signal delivery.
+                    # Ctrl+C alone is not always enough: some SSH/tmux setups
+                    # and supervised processes can consume the raw \x03 byte
+                    # here without ever raising SIGINT, leaving no other way
+                    # to stop the bot from inside the dashboard.
+                    stop.set()
+                    main_bot.stop_event.set()
 
             # A reconnect (or anything else that may have disturbed the
             # terminal) asks for one clean full redraw here, on the render

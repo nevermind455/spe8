@@ -83,6 +83,35 @@ MAX_BUY_PRICE = _env_float("MAX_BUY_PRICE", "0.90")
 # to read a 3-point edge.
 SIG_PRICE_MIN_MOVE_BPS = _env_float("SIG_PRICE_MIN_MOVE_BPS", "0")
 MIN_BUY_PRICE = _env_float("MIN_BUY_PRICE", "0.20")
+# ---- primary-entry price band --------------------------------------------
+# MIN/MAX_BUY_PRICE are the ACCOUNT-wide bounds: the widest any order may go.
+# These two narrow that band for a PRIMARY phase-2 entry only - the leg that
+# follows the signal - and leave a taper hedge leg on the account bounds.
+#
+# Why the split. Measured over 620 settled fills (Aug 26 - Sep 09), the two
+# leg types are priced completely differently for almost the same hit rate:
+#
+#     PRIMARY  521 fills  avg price 0.577  hit 52%  edge -0.058  -12.3%
+#     HEDGE     99 fills  avg price 0.418  hit 54%  edge +0.118  +24.4%
+#
+# Bucketed by price paid, the hit rate tracked the price to within a couple
+# of points in every bucket - the book is efficiently priced and there is no
+# selection edge to harvest - so what decides the result is what gets paid.
+# 0.60-0.80 alone held 52% of turnover at -0.047/-0.060 edge. A ceiling on
+# the primary leg attacks that directly; a floor keeps it out of the deep
+# longshots, where 4 primary fills under 0.15 returned -100%.
+#
+# The hedge is deliberately NOT capped or floored here: its edge is largest
+# in exactly the cheap buckets a shared floor would forbid (+74.5% under
+# 0.15 across 6 fills). Note this means the ACCOUNT floor must stay low -
+# both brokers may only TIGHTEN these per-order bounds, never loosen them,
+# so a high MIN_BUY_PRICE would silently re-impose itself on the hedge.
+#
+# Both default to the account bound, so this is inert until set.
+PRIMARY_ENTRY_MIN_PRICE = _env_float(
+    "PRIMARY_ENTRY_MIN_PRICE", str(MIN_BUY_PRICE))
+PRIMARY_ENTRY_MAX_PRICE = _env_float(
+    "PRIMARY_ENTRY_MAX_PRICE", str(MAX_BUY_PRICE))
 BTC_STALE_AFTER = _env_float("BTC_STALE_AFTER", "3.0")
 # How long the book we hold may have been in our hands. For a REST read
 # this is the request round trip, so it stays near zero.
@@ -397,6 +426,26 @@ def pair_lock_permits(entry_price, entry_fee_per_share,
     return locked >= PAIR_LOCK_MIN_EDGE, locked
 
 
+# ---- tapering entry + growing hedge (PAPER only) ---------------------------
+# Backtested against 102 real settled rounds before being wired in: capping
+# same-side pyramiding after a couple of confirmations and routing further
+# confirmations into a small hedge on the complement improved both total P&L
+# and max drawdown versus letting a round pyramid unbounded. PAPER only by
+# runtime check in main_bot.py, not just this default - a signal that has
+# already lost ~$589 once on old code gets a second, cheaper way to be wrong.
+TAPER_HEDGE_ENABLED = bool(_env_bool("TAPER_HEDGE_ENABLED", False))
+TAPER_ENTRY1_USD = _env_float("TAPER_ENTRY1_USD", "3.0")
+TAPER_ENTRY2_USD = _env_float("TAPER_ENTRY2_USD", "2.0")
+TAPER_HEDGE_INCREMENT_USD = _env_float("TAPER_HEDGE_INCREMENT_USD", "1.0")
+for _taper_name, _taper_value in (
+        ("TAPER_ENTRY1_USD", TAPER_ENTRY1_USD),
+        ("TAPER_ENTRY2_USD", TAPER_ENTRY2_USD),
+        ("TAPER_HEDGE_INCREMENT_USD", TAPER_HEDGE_INCREMENT_USD)):
+    if not math.isfinite(_taper_value) or _taper_value <= 0:
+        raise ValueError(f"{_taper_name} must be finite and positive")
+del _taper_name, _taper_value
+
+
 def entry_cost_ceiling(cap_price: float) -> float:
     """The most one entry can take out of the account at this price cap.
 
@@ -515,6 +564,20 @@ if not math.isfinite(MIN_BUY_PRICE) or not 0 < MIN_BUY_PRICE < 1:
     raise ValueError("MIN_BUY_PRICE must be strictly between 0 and 1")
 if not MIN_BUY_PRICE < MAX_BUY_PRICE:
     raise ValueError("MIN_BUY_PRICE must be below MAX_BUY_PRICE")
+# The per-order bounds may only tighten the account band - both brokers
+# enforce that at execution, so a value outside it would be silently ignored
+# rather than applied. Refuse it here instead, where it is visible.
+if (not math.isfinite(PRIMARY_ENTRY_MIN_PRICE)
+        or not MIN_BUY_PRICE <= PRIMARY_ENTRY_MIN_PRICE < 1):
+    raise ValueError(
+        "PRIMARY_ENTRY_MIN_PRICE must be at or above MIN_BUY_PRICE and below 1")
+if (not math.isfinite(PRIMARY_ENTRY_MAX_PRICE)
+        or not 0 < PRIMARY_ENTRY_MAX_PRICE <= MAX_BUY_PRICE):
+    raise ValueError(
+        "PRIMARY_ENTRY_MAX_PRICE must be positive and at or below MAX_BUY_PRICE")
+if not PRIMARY_ENTRY_MIN_PRICE < PRIMARY_ENTRY_MAX_PRICE:
+    raise ValueError(
+        "PRIMARY_ENTRY_MIN_PRICE must be below PRIMARY_ENTRY_MAX_PRICE")
 # Window and band shapes are validated in _parse_bands; what is left is the
 # cadence fitting the tightest window, and the stake clearing the venue
 # minimum at the most expensive price any band can reach.

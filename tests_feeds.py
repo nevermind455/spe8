@@ -1441,6 +1441,177 @@ def t_paper_state_paths_include_isolated_trade_log():
                 os.environ[name] = value
 
 
+async def t_stop_loss_does_not_resubmit_unconfirmed_shares():
+    """A lagging private-fill confirmation must not cause a duplicate exit.
+
+    _stop_loss_loop used to gate resubmission on a fixed grace timer: once it
+    expired, the next poll saw the ledger's still-stale `shares` and fired a
+    fresh sell for the FULL amount, even though the earlier FAK submission had
+    already been accepted by the venue. This drives the loop directly and
+    checks that a stale ledger never produces a second sell for shares an
+    earlier attempt already covers, while genuinely new exposure on the same
+    token still gets sold on its own.
+    """
+    import run_feeds
+    import config
+    import timer
+
+    orig_unix = timer.unix
+    orig = {
+        "arm": config.STOP_LOSS_ARM_SECONDS,
+        "cutoff": config.STOP_LOSS_EXIT_CUTOFF_SECONDS,
+        "price": config.STOP_LOSS_PRICE,
+        "floor": config.STOP_LOSS_FLOOR_PRICE,
+        "poll": config.STOP_LOSS_POLL_SECONDS,
+    }
+    try:
+        window = timer.window_start(timer.unix())
+        sampled = window + 100.0  # remain = 200s: inside the arm window below
+        timer.unix = lambda ts=None: (sampled if ts is None else float(ts))
+        config.STOP_LOSS_ARM_SECONDS = 250.0
+        config.STOP_LOSS_EXIT_CUTOFF_SECONDS = 20.0
+        config.STOP_LOSS_PRICE = 0.5
+        config.STOP_LOSS_FLOOR_PRICE = 0.1
+        config.STOP_LOSS_POLL_SECONDS = 0.002
+
+        token, condition = "T1", "C1"
+        pos = types.SimpleNamespace(settled=False, shares=10.0, condition_id=condition)
+
+        class FakeLedger:
+            _lock = threading.Lock()
+            positions = {token: pos}
+
+        class FakeView:
+            best_bid = 0.3
+
+        class FakeBook:
+            def view(self, tok):
+                return FakeView()
+
+        class FakeHub:
+            condition_id = condition
+            book = FakeBook()
+
+        sells: list[tuple[str, float]] = []
+
+        class FakeBroker:
+            last_error = None
+
+            def sell_shares(self, tok, shares, **_kw):
+                sells.append((tok, round(float(shares), 6)))
+                if len(sells) == 1:
+                    # Accepted by the venue, but the private stream lags -
+                    # the ledger is deliberately left stale.
+                    return shares
+                pos.shares = 0.0  # second attempt settles synchronously
+                return shares
+
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            run_feeds._stop_loss_loop(FakeHub(), FakeBroker(), FakeLedger(),
+                                      stop, lambda *a, **k: None))
+        try:
+            await asyncio.sleep(0.05)
+            check("first poll submits the full held position",
+                  sells == [(token, 10.0)], str(sells))
+
+            await asyncio.sleep(0.05)
+            check("a lagging ledger does not trigger a resubmission",
+                  sells == [(token, 10.0)], str(sells))
+
+            pos.shares = 0.0  # private stream confirms the earlier fill
+            await asyncio.sleep(0.05)
+            check("confirming the fill still does not resubmit",
+                  sells == [(token, 10.0)], str(sells))
+
+            pos.shares = 3.0  # fresh exposure appears on the same token
+            await asyncio.sleep(0.05)
+            check("new exposure is sold on its own, not the stale full amount",
+                  sells == [(token, 10.0), (token, 3.0)], str(sells))
+
+            await asyncio.sleep(0.05)
+            check("once flat and fired, no further attempts follow",
+                  sells == [(token, 10.0), (token, 3.0)], str(sells))
+        finally:
+            stop.set()
+            await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        timer.unix = orig_unix
+        config.STOP_LOSS_ARM_SECONDS = orig["arm"]
+        config.STOP_LOSS_EXIT_CUTOFF_SECONDS = orig["cutoff"]
+        config.STOP_LOSS_PRICE = orig["price"]
+        config.STOP_LOSS_FLOOR_PRICE = orig["floor"]
+        config.STOP_LOSS_POLL_SECONDS = orig["poll"]
+
+
+async def t_live_exit_broker_flags_a_submission_that_crossed_the_cutoff():
+    """LIVE has no PAPER-style post-latency abort; it must at least flag one.
+
+    PaperBroker.sell_shares re-checks the exit cutoff after its modeled
+    latency and refuses to fill if it has passed. _LiveExitBroker cannot do
+    that symmetric check before submitting - the real network round trip IS
+    the latency, and the FAK has already resolved at the venue by the time
+    sell_shares() returns - so nothing previously re-validated the clock
+    afterward. This checks that a submission whose round trip ate the whole
+    cutoff budget is now flagged via `last_late`, and that an ordinary
+    well-inside-the-cutoff submission is not.
+    """
+    _stub_sdks()
+    import run_feeds
+    import polymarket_trade
+    import timer
+
+    broker = run_feeds._LiveExitBroker()
+    orig_sell = polymarket_trade.sell_shares
+    orig_error = polymarket_trade.last_order_error
+    orig_unix = timer.unix
+    try:
+        window_end = timer.window_start(timer.unix()) + 300.0
+        cutoff_seconds = 20.0
+
+        # Simulate a slow network round trip: by the time sell_shares()
+        # would return, real wall-clock time has crossed the cutoff.
+        calls = {"n": 0}
+
+        def slow_sell(*_a, **_k):
+            calls["n"] += 1
+            timer.unix = lambda ts=None: (
+                (window_end - cutoff_seconds + 1.0) if ts is None else float(ts))
+            polymarket_trade.last_order_error = None
+            return 4.0
+
+        timer.unix = lambda ts=None: (
+            (window_end - cutoff_seconds - 5.0) if ts is None else float(ts))
+        polymarket_trade.sell_shares = slow_sell
+        sold = broker.sell_shares("tok", 4.0, condition_id="cond",
+                                  window_end=window_end,
+                                  exit_cutoff_seconds=cutoff_seconds)
+        check("the late-arriving fill is still reported as sold",
+              sold == 4.0, str(sold))
+        check("a round trip that crossed the cutoff is flagged",
+              broker.last_late is True)
+        check("one submission attempt was made", calls["n"] == 1, str(calls))
+
+        # An ordinary fast round trip, well inside the cutoff, is not flagged.
+        def fast_sell(*_a, **_k):
+            polymarket_trade.last_order_error = None
+            return 4.0
+
+        timer.unix = lambda ts=None: (
+            (window_end - cutoff_seconds - 60.0) if ts is None else float(ts))
+        polymarket_trade.sell_shares = fast_sell
+        sold = broker.sell_shares("tok", 4.0, condition_id="cond",
+                                  window_end=window_end,
+                                  exit_cutoff_seconds=cutoff_seconds)
+        check("an ordinary in-time fill is not flagged as late",
+              broker.last_late is False)
+        check("still reports the sold shares", sold == 4.0, str(sold))
+    finally:
+        polymarket_trade.sell_shares = orig_sell
+        polymarket_trade.last_order_error = orig_error
+        timer.unix = orig_unix
+
+
 TRADING_FILES = ["main_bot.py", "strategy.py", "polymarket_trade.py", "orderbook.py",
                  "chainlink.py", "market_discovery.py", "price_ws.py", "timer.py",
                  "config.py"]
@@ -1453,15 +1624,29 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # platform difference rather than on an edit, which is exactly the noise
     # that made it useless before. .gitattributes now pins text files to LF
     # so the digest means the same thing on both.
-    "main_bot.py": "3c95120ffb6d6ac4fc185da153eaa6d8608a0a8105c15b4d1bdd3841fc5b25f1",
+    # main_bot.py, polymarket_trade.py, orderbook.py re-approved 2026-09-09:
+    # SIGNAL_MINORITY_RULE guard fix, venue-minimum sizing dedup (see
+    # orderbook.venue_minimum_stake). main_bot.py, config.py re-approved again
+    # same day: TAPER_HEDGE_ENABLED (PAPER-only tapering entry + growing
+    # hedge, backtested against 102 real settled rounds - see the entry-cap
+    # analysis).
+    # main_bot.py re-approved 2026-09-09: the taper cycle now follows the
+    # signal - a flip away from the side a cycle was built on retires that
+    # cycle and restarts from entry 1 on the new side, instead of holding
+    # the original anchor for the rest of the round.
+    # main_bot.py, config.py re-approved 2026-09-09: PRIMARY_ENTRY_MIN/MAX_PRICE
+    # - a tighter price band for primary phase-2 entries, with taper hedge legs
+    # left on the account bounds. Measured over 620 settled fills: primary paid
+    # 0.577 for a 52% hit rate (edge -0.058), hedge paid 0.418 for 54% (+0.118).
+    "main_bot.py": "a6560ef13d53d7d9fdd16d99aae896a105e7c64a25b92e1b016d9430ec1652c5",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
-    "polymarket_trade.py": "587153e96294e591864e87ec10bfc7b7135a76dd193aba993aa32980ab3ae3a6",
-    "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",
+    "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
+    "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
     "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "b3980ebdc04bee93a7d32b61913e54293cfeff2f952121456f56a6f1a6aa72f2",
+    "config.py": "07fa9d9b9a00c90b5b8b375376147d8e563aa6b8f74c2a12674ce556db9e5fba",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)
@@ -1490,7 +1675,14 @@ def _stub_sdks():
 
 def t_trading_file_baselines():
     for name in TRADING_FILES:
-        digest = hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        # Digest the file as GIT STORES it, not as the working copy
+        # happens to sit on disk. .gitattributes pins text to LF, but a
+        # Windows checkout can still hold CRLF, and hashing raw bytes made
+        # this guard fire on a fresh clone (every LF file differing from a
+        # CRLF-recorded baseline) rather than on an actual edit - the exact
+        # platform-difference noise it was rewritten to stop.
+        raw = (ROOT / name).read_bytes().replace(b"\r\n", b"\n")
+        digest = hashlib.sha256(raw).hexdigest()
         check(f"approved baseline {name}", digest == BASELINE_SHA[name],
               f"{digest[:12]} != {BASELINE_SHA[name][:12]}")
 

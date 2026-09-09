@@ -126,6 +126,50 @@ def test_geometry() -> None:
             check(f"width {tag} {cols}x{rows}", not bad, f"rows {bad[:3]}")
 
 
+def _frame_text(snap, cols: int, rows: int) -> str:
+    return "\n".join("".join(t for t, _ in row) for row in build(snap, cols, rows, UNICODE))
+
+
+def test_stop_panel_appears_when_stop_loss_is_enabled() -> None:
+    """state.exits/state.stop_status must actually reach a rendered panel.
+
+    They used to be copied into every snapshot and then read by nothing: an
+    operator running with STOP_LOSS_ENABLED=1 had zero dashboard visibility
+    into what the stop was watching or had sold. This checks the STOP LOSS
+    panel actually appears (wide and narrow layouts) once stop_status says
+    the feature is enabled, and that the geometry contract still holds; and
+    that it stays absent when the feature is off, matching this repo's
+    default (STOP_LOSS_ENABLED=0) so existing behavior is unchanged then.
+    """
+    st = populated()
+    st.exits = [{"time": "21:07:03", "side": "UP", "shares": 4.6,
+                 "price": 0.24, "proceeds": 1.08}]
+    st.stop_status = {
+        "enabled": True, "armed": True, "trigger": 0.25, "floor": 0.05,
+        "arm": 120.0, "cutoff": 20.0,
+        "held": [{"side": "UP", "shares": 4.6, "bid": 0.23}],
+    }
+    snap = snapshot(st, session_trades=st.trades)
+    for cols, rows in ((160, 45), (118, 40)):
+        frame = build(snap, cols, rows, UNICODE)
+        check(f"rowcount with stop panel {cols}x{rows}",
+              len(frame) == rows, f"got {len(frame)}")
+        bad = [(i, sum(len(t) for t, _ in row)) for i, row in enumerate(frame)
+               if sum(len(t) for t, _ in row) != cols]
+        check(f"width with stop panel {cols}x{rows}", not bad, f"rows {bad[:3]}")
+        text = _frame_text(snap, cols, rows)
+        check(f"STOP LOSS panel renders at {cols}x{rows}", "STOP LOSS" in text)
+
+    # Off by default: nothing about the layout changes when the feature is
+    # disabled, which is this repo's out-of-the-box configuration.
+    off = populated()
+    off_snap = snapshot(off, session_trades=off.trades)
+    for cols, rows in ((160, 45), (118, 40)):
+        text = _frame_text(off_snap, cols, rows)
+        check(f"STOP LOSS panel absent when disabled {cols}x{rows}",
+              "STOP LOSS" not in text)
+
+
 def test_one_sided_books_render_at_every_size() -> None:
     """A temporarily empty side of the live book must not break the frame."""
     fixtures = (
@@ -467,6 +511,63 @@ def test_selftest_survives_ascii_strict_stdout() -> None:
           b"selftest: PASS" in proc.stdout, detail)
 
 
+def test_quit_key_stops_the_render_loop() -> None:
+    """'q' must stop the terminal exactly like Ctrl+C, independent of SIGINT.
+
+    render_loop's software-level quit key was dropped at some point, leaving
+    an OS SIGINT (via Ctrl+C) as the only way to stop the dashboard - which
+    does not always reach the process in every SSH/tmux/supervised setup.
+    This drives render_loop directly with a fake key reader and checks that
+    'q' (and Ctrl+C's raw \\x03 byte) sets both the loop's own stop event and
+    main_bot.stop_event, and that an unrelated key does neither.
+    """
+    import asyncio
+    import threading
+
+    import main_bot
+    import run_terminal
+    from dashboard.renderer import PlainRenderer
+
+    class FakeKeys:
+        def __init__(self, chars):
+            self._chars = list(chars)
+
+        def pop(self):
+            out, self._chars = self._chars, []
+            return out
+
+    async def drive(chars, *, expect_stop):
+        st = TerminalState()
+        stop = threading.Event()
+        renderer = PlainRenderer(stream=io.StringIO(), every=1000.0)
+        keys = FakeKeys(chars)
+        main_bot.stop_event.clear()
+        task = asyncio.create_task(
+            run_terminal.render_loop(st, stop, keys, renderer))
+        try:
+            if expect_stop:
+                await asyncio.wait_for(task, timeout=2.0)
+                return stop.is_set(), main_bot.stop_event.is_set()
+            await asyncio.sleep(0.3)
+            return stop.is_set(), main_bot.stop_event.is_set()
+        finally:
+            stop.set()
+            if not task.done():
+                await asyncio.wait_for(task, timeout=2.0)
+
+    stopped, bot_stopped = asyncio.run(drive(["q"], expect_stop=True))
+    check("'q' stops the render loop", stopped)
+    check("'q' also sets main_bot.stop_event", bot_stopped)
+
+    stopped, bot_stopped = asyncio.run(drive(["\x03"], expect_stop=True))
+    check("Ctrl+C's raw byte stops the render loop too", stopped)
+    check("Ctrl+C's raw byte also sets main_bot.stop_event", bot_stopped)
+
+    stopped, bot_stopped = asyncio.run(drive(["x"], expect_stop=False))
+    check("an unrelated key does not stop the loop", not stopped)
+    check("an unrelated key does not touch main_bot.stop_event", not bot_stopped)
+
+
 def test_render_row_resets() -> None:
     line = render_row(pad([("hi", Style("green"))], 10))
     check("row ends reset", line.endswith("\x1b[0m"))
@@ -712,21 +813,42 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # platform difference rather than on an edit, which is exactly the noise
     # that made it useless before. .gitattributes now pins text files to LF
     # so the digest means the same thing on both.
-    "main_bot.py": "3c95120ffb6d6ac4fc185da153eaa6d8608a0a8105c15b4d1bdd3841fc5b25f1",
+    # main_bot.py, polymarket_trade.py, orderbook.py re-approved 2026-09-09:
+    # SIGNAL_MINORITY_RULE guard fix, venue-minimum sizing dedup (see
+    # orderbook.venue_minimum_stake). main_bot.py, config.py re-approved again
+    # same day: TAPER_HEDGE_ENABLED (PAPER-only tapering entry + growing
+    # hedge, backtested against 102 real settled rounds - see the entry-cap
+    # analysis).
+    # main_bot.py re-approved 2026-09-09: the taper cycle now follows the
+    # signal - a flip away from the side a cycle was built on retires that
+    # cycle and restarts from entry 1 on the new side, instead of holding
+    # the original anchor for the rest of the round.
+    # main_bot.py, config.py re-approved 2026-09-09: PRIMARY_ENTRY_MIN/MAX_PRICE
+    # - a tighter price band for primary phase-2 entries, with taper hedge legs
+    # left on the account bounds. Measured over 620 settled fills: primary paid
+    # 0.577 for a 52% hit rate (edge -0.058), hedge paid 0.418 for 54% (+0.118).
+    "main_bot.py": "a6560ef13d53d7d9fdd16d99aae896a105e7c64a25b92e1b016d9430ec1652c5",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
-    "polymarket_trade.py": "587153e96294e591864e87ec10bfc7b7135a76dd193aba993aa32980ab3ae3a6",
-    "orderbook.py": "ebe82f7071b8e3113b4b371164a875aac3a505cd7f8a4eb92817e56aa3ca681a",
+    "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
+    "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
     "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "b3980ebdc04bee93a7d32b61913e54293cfeff2f952121456f56a6f1a6aa72f2",
+    "config.py": "07fa9d9b9a00c90b5b8b375376147d8e563aa6b8f74c2a12674ce556db9e5fba",
 }
 
 
 def test_trading_file_baselines() -> None:
     for name in TRADING_FILES:
-        digest = hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        # Digest the file as GIT STORES it, not as the working copy
+        # happens to sit on disk. .gitattributes pins text to LF, but a
+        # Windows checkout can still hold CRLF, and hashing raw bytes made
+        # this guard fire on a fresh clone (every LF file differing from a
+        # CRLF-recorded baseline) rather than on an actual edit - the exact
+        # platform-difference noise it was rewritten to stop.
+        raw = (ROOT / name).read_bytes().replace(b"\r\n", b"\n")
+        digest = hashlib.sha256(raw).hexdigest()
         check(f"approved baseline {name}", digest == BASELINE_SHA[name],
               f"{digest[:12]} != {BASELINE_SHA[name][:12]}")
 
@@ -1130,6 +1252,264 @@ def test_collateral_balance_uses_pusd_units() -> None:
         trade._client = original
         trade.AssetType = original_asset_type
         trade.BalanceAllowanceParams = original_params
+
+
+def test_unsent_attempts_are_not_counted_as_failed_sends() -> None:
+    """An attempt the bot declined to submit is not a rejected order.
+
+    Regression: `_dist` derived failures as "every row that is not a
+    success" (`len(trades) - oks`), so a phase-2 attempt the bot deliberately
+    did NOT submit - skipped_unfillable, because the leg priced through
+    MAX_BUY_PRICE - was booked as a failed SEND. On a live paper run that
+    rendered as `SENT FAIL 1 50%` in SIGNAL DISTRIBUTION beside
+    `ORDERS OK/FAIL 1 / 0` and `SEND RATE 100%` in the cash panel: one
+    dashboard giving two different answers for the same round. The trade log
+    stamped the same row a red REJECT, indistinguishable from a venue
+    refusal.
+    """
+    from dashboard.layout import _trade_sent, _trade_success
+
+    for skipped in ("skipped_unfillable", "skipped_signal_moved",
+                    "skipped_pair_would_lose"):
+        check(f"{skipped} never reached submission", not _trade_sent(skipped))
+        check(f"{skipped} is not a success", not _trade_success(skipped))
+    # rejected_or_unsubmitted keeps the bucket it has always had: the row
+    # alone cannot say which half of that name applied.
+    for submitted in ("paper_filled", "matched", "accepted_pending_confirmation",
+                      "rejected_or_unsubmitted"):
+        check(f"{submitted} counts as a send", _trade_sent(submitted))
+
+    st = populated()
+    st.trades = [
+        {"time_et": "Aug 09 21:04:58 ET", "phase": "phase2", "side": "DOWN",
+         "amount": 3.0, "price_side": "DOWN", "book_side": "DOWN",
+         "chainlink_side": "", "result": "paper_filled"},
+        {"time_et": "Aug 09 21:05:11 ET", "phase": "phase2", "side": "DOWN",
+         "amount": 2.0, "price_side": "DOWN", "book_side": "DOWN",
+         "chainlink_side": "", "result": "skipped_unfillable"},
+    ]
+    snap = snapshot(st, session_trades=st.trades)
+    frame = build(snap, 160, 50, UNICODE)
+    lines = ["".join(text for text, _ in row) for row in frame]
+    full = "\n".join(lines)
+
+    ok_line = next((ln for ln in lines if "SENT OK" in ln), "")
+    fail_line = next((ln for ln in lines if "SENT FAIL" in ln), "")
+    decide_line = next((ln for ln in lines if "DECIDE DOWN" in ln), "")
+    check("the single submitted order is the whole SENT denominator",
+          "1 100%" in ok_line, ok_line)
+    check("the unsent attempt is not a failed send",
+          "0   0%" in fail_line, fail_line)
+    check("both attempts still count as decisions",
+          "2 100%" in decide_line, decide_line)
+    # The count must still be visible somewhere: silently dropping the row
+    # from every bar would be a quieter version of the same bug.
+    not_sent_line = next((ln for ln in lines if "NOT SENT" in ln), "")
+    check("the skipped attempt is still reported, not dropped",
+          "1  50%" in not_sent_line, ascii(not_sent_line))
+
+    # Scoped to the trade log's own rows. A frame-wide search would also hit
+    # the PLACE FOK pipeline row, which says REJECTED for populated()'s
+    # seeded order-counter sample and has nothing to do with these rows.
+    skip_row = next((ln for ln in lines if "21:05:11" in ln), "")
+    fill_row = next((ln for ln in lines if "21:04:58" in ln), "")
+    check("a never-submitted row reads SKIP, not REJECT",
+          "SKIP" in skip_row and "REJECT" not in skip_row, ascii(skip_row[:140]))
+    check("the accepted entry is untouched by the new branch",
+          "SKIP" not in fill_row and "REJECT" not in fill_row,
+          ascii(fill_row[:140]))
+
+    # Geometry is a hard contract for every frame this file builds.
+    check("rowcount survives the skip note", len(frame) == 50, str(len(frame)))
+    bad = [(i, sum(len(t) for t, _ in row)) for i, row in enumerate(frame)
+           if sum(len(t) for t, _ in row) != 160]
+    check("width survives the skip note", not bad, f"rows {bad[:3]}")
+
+
+def test_rejected_send_still_reads_as_a_failed_send() -> None:
+    """The fix must not swing the other way and hide real refusals."""
+    st = populated()
+    st.trades = [
+        {"time_et": "Aug 09 21:04:58 ET", "phase": "phase2", "side": "UP",
+         "amount": 2.0, "price_side": "UP", "book_side": "UP",
+         "chainlink_side": "", "result": "rejected_or_unsubmitted"},
+    ]
+    snap = snapshot(st, session_trades=st.trades)
+    lines = ["".join(text for text, _ in row)
+             for row in build(snap, 160, 50, UNICODE)]
+    full = "\n".join(lines)
+    fail_line = next((ln for ln in lines if "SENT FAIL" in ln), "")
+    ok_line = next((ln for ln in lines if "SENT OK" in ln), "")
+    check("a refused submission is still a failed send",
+          "1 100%" in fail_line, fail_line)
+    check("and is not counted as a successful one", "0   0%" in ok_line, ok_line)
+    reject_row = next((ln for ln in lines if "21:04:58" in ln), "")
+    check("it still reads REJECT in the trade log",
+          "REJECT" in reject_row and "SKIP" not in reject_row,
+          ascii(reject_row[:140]))
+    check("no NOT SENT bar when nothing was skipped",
+          not any("NOT SENT" in ln for ln in lines), ascii(full[:200]))
+
+
+def _with_positions(**over):
+    """populated() plus a two-leg round and a third position still settling."""
+    st = populated()
+    st.tokens.set({"slug": "btc-updown-5m-1754780700",
+                   "up_token_id": "72131", "down_token_id": "88214"})
+    st.accounting = {
+        "realized_pnl": -27.1988,
+        "unrealized_mark_to_bid": -0.25,
+        "total_pnl": -27.4488,
+        "open_position_details": [
+            {"token_id": "72131", "shares": 12.5, "average_entry_price": 0.412,
+             "cost": 5.15, "mark_bid": 0.38, "unrealized_to_bid": -0.40},
+            {"token_id": "88214", "shares": 5.0, "average_entry_price": 0.88,
+             "cost": 4.40, "mark_bid": 0.91, "unrealized_to_bid": 0.15},
+            {"token_id": "prev-round", "shares": 5.0,
+             "average_entry_price": 0.5, "cost": 2.5, "mark_bid": 0.5,
+             "unrealized_to_bid": 0.0},
+        ],
+    }
+    for k, v in over.items():
+        setattr(st, k, v)
+    return st
+
+
+def _pos_rows(snap, cols: int = 160, rows: int = 50):
+    """(all lines, panel block, UP leg row, DOWN leg row) for POSITIONS.
+
+    Legs are located by their share count, not by column spacing: the first
+    version of these assertions matched an exact run of spaces and broke the
+    moment the SIDE column was retrimmed. The combined "UP / DOWN SHARES"
+    footer row repeats the same numbers, so rows holding "/" are excluded.
+    """
+    lines = ["".join(text for text, _ in row)
+             for row in build(snap, cols, rows, UNICODE)]
+    start = next(i for i, ln in enumerate(lines) if "POSITIONS" in ln)
+    block = lines[start:start + 12]
+    def leg(marker):
+        return next((ln for ln in block if marker in ln and "/" not in ln), "")
+    return lines, block, leg("12.500"), leg("5.000")
+
+
+def test_positions_panel_replaces_the_band_log_by_default() -> None:
+    """The band slot shows the live position while PHASE1 is off.
+
+    PHASE1_ENABLED=0 is this repo's default, so that slot rendered "bands are
+    OFF" on every frame while what the position actually was had to be read
+    off three other panels. This checks the panel reports each side's held
+    shares, the share-weighted average it was built at, the live bid and the
+    mark-to-bid P&L - all values the ledger already computes, so the panel
+    must not disagree with STAKE / PNL.
+    """
+    snap = snapshot(_with_positions(), session_trades=[])
+    lines, _block, up, down = _pos_rows(snap)
+    full = "\n".join(lines)
+
+    check("the positions panel takes the slot", "POSITIONS" in full,
+          ascii(full[:200]))
+    check("the band log is not also drawn", "BAND TRADES" not in full,
+          ascii(full[:200]))
+
+    check("UP row carries shares, average and running cost",
+          "0.412" in up and "$5.15" in up, ascii(up[:160]))
+    check("UP row carries its mark-to-bid loss", "$-0.40" in up, ascii(up[:160]))
+    check("DOWN row carries shares, average and running cost",
+          "0.880" in down and "$4.40" in down, ascii(down[:160]))
+    check("DOWN row carries its mark-to-bid gain", "$+0.15" in down,
+          ascii(down[:160]))
+
+    # BID is the first column shed when the panel is narrow - PNL already
+    # carries the mark and MARKET MATRIX shows both live bids - but it must
+    # come back once there is room, rather than being dropped for good.
+    _wl, _wb, wide_up, _wd = _pos_rows(snap, cols=200)
+    check("a wider terminal restores the live bid alongside cost",
+          "0.380" in wide_up and "$5.15" in wide_up, ascii(wide_up[:200]))
+
+    # Shares appear nowhere else on the dashboard, so no width may shed them.
+    # An earlier version of the COST column dropped SHARES at 120 and 140 to
+    # make room, which is the wrong trade.
+    for cols in (120, 140, 160, 200, 240):
+        narrow, _nb, row_up, row_dn = _pos_rows(snap, cols=cols)
+        check(f"UP shares survive at {cols} cols", bool(row_up), str(cols))
+        check(f"DOWN shares survive at {cols} cols", bool(row_dn), str(cols))
+        # AVG is the price every other figure is judged against; it must not
+        # be traded away for COST at any width (it briefly was).
+        check(f"UP average price survives at {cols} cols",
+              "0.412" in row_up, ascii(row_up[:200]))
+        check(f"DOWN average price survives at {cols} cols",
+              "0.880" in row_dn, ascii(row_dn[:200]))
+        # The combined figure is a full-width row, so it cannot be trimmed
+        # out the way a column can.
+        # The label abbreviates on a narrow panel; the numbers must not.
+        combined = next((ln for ln in narrow
+                         if "UP / DOWN SHARES" in ln or "UP / DN SH" in ln), "")
+        check(f"combined shares row present at {cols} cols",
+              "12.500 / 5.000" in combined, ascii(combined[:200]))
+
+    # Scoped to the panel's own block: TOTAL PNL also appears in STAKE / PNL
+    # higher up the frame, at a different precision.
+    start = next(i for i, ln in enumerate(lines) if "POSITIONS" in ln)
+    block = lines[start:start + 12]
+    cost = next((ln for ln in block if "ROUND COST" in ln), "")
+    pnl = next((ln for ln in block if "ROUND PNL" in ln), "")
+    total = next((ln for ln in block if "TOTAL PNL" in ln), "")
+    check("round cost sums both legs (5.15 + 4.40)", "$9.55" in cost,
+          ascii(cost[:160]))
+    check("round P&L sums both legs (-0.40 + 0.15)", "$-0.25" in pnl,
+          ascii(pnl[:160]))
+    check("account total P&L is the ledger's, not a re-derivation",
+          "$-27.45" in total, ascii(total[:160]))
+
+    # A position on another market is still real money; it must be declared
+    # rather than silently excluded from a panel that reads as the book.
+    check("positions outside this round are declared", "+1 settling" in full,
+          ascii(full[:200]))
+
+
+def test_positions_panel_invents_nothing_when_flat() -> None:
+    """A fresh wallet must render dashes, not zeros."""
+    st = populated()
+    st.tokens.set({"slug": "s", "up_token_id": "72131",
+                   "down_token_id": "88214"})
+    st.accounting = {"realized_pnl": 0.0, "open_position_details": []}
+    snap = snapshot(st, session_trades=[])
+    lines = ["".join(text for text, _ in row)
+             for row in build(snap, 160, 50, UNICODE)]
+    start = next(i for i, ln in enumerate(lines) if "POSITIONS" in ln)
+    block = lines[start:start + 11]
+    up = next((ln for ln in block if ln.count("UP") and "SIDE" not in ln), "")
+    check("a flat UP leg shows the missing marker, not 0.000",
+          "--" in up and "0.000" not in up, ascii(up[:160]))
+    check("no fabricated cost",
+          not any("$0.00" in ln for ln in block),
+          ascii("|".join(block)[:300]))
+
+
+def test_band_log_reclaims_the_slot_when_bands_are_on() -> None:
+    """Turning PHASE1 on must not cost the operator the band record."""
+    st = _with_positions()
+    st.bands_enabled = True
+    snap = snapshot(st, session_trades=st.trades)
+    full = "\n".join("".join(text for text, _ in row)
+                       for row in build(snap, 160, 50, UNICODE))
+    check("bands on -> band log is drawn", "BAND TRADES" in full,
+          ascii(full[:200]))
+    check("bands on -> positions panel yields the slot",
+          "POSITIONS" not in full, ascii(full[:200]))
+
+
+def test_positions_panel_holds_geometry_at_every_size() -> None:
+    """The panel is adaptive; the frame contract is not negotiable."""
+    snap = snapshot(_with_positions(), session_trades=[])
+    for cols, rows in SIZES:
+        frame = build(snap, cols, rows, UNICODE)
+        check(f"rowcount positions {cols}x{rows}", len(frame) == rows,
+              f"got {len(frame)}")
+        bad = [(i, sum(len(t) for t, _ in row))
+               for i, row in enumerate(frame)
+               if sum(len(t) for t, _ in row) != cols]
+        check(f"width positions {cols}x{rows}", not bad, f"rows {bad[:3]}")
 
 
 # -------------------------------------------------------------------- main ---

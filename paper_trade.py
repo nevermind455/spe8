@@ -36,7 +36,7 @@ from urllib.parse import urlsplit
 import requests
 
 import http_pool
-
+import orderbook
 import timer
 from accounting.ledger import Ledger, _fsync_directory
 
@@ -129,6 +129,9 @@ def _pre_submit_guard_error(pre_submit_guard) -> str | None:
         # The callback may close over credentials or remote messages.  Its
         # exception text does not belong in the durable paper audit journal.
         return f"pre-submit guard failed closed: {type(exc).__name__}"
+    from polymarket_trade import GuardRejection
+    if isinstance(allowed, GuardRejection):
+        return f"pre-submit guard rejected order: {allowed.reason}"
     if allowed is not True:
         return "pre-submit guard rejected order"
     return None
@@ -496,9 +499,9 @@ def size_to_venue_minimum(amount, book: BookSnapshot, rules: MarketRules,
                           max_price) -> Decimal:
     """Raise a dollar stake just enough to buy the venue's minimum shares.
 
-    Best-ask * minimum is not enough: a thin top of book makes a $2.50 FOK
-    walk into 0.51 and land at 4.96 shares. Walk the same asks the fill
-    will consume.
+    The ask-ladder walk itself lives in orderbook.venue_minimum_stake,
+    shared with polymarket_trade.py's live order sizing, so a correction
+    only ever needs to land once.
     """
     wanted = _decimal(amount, name="amount").quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     minimums = [v for v in (book.min_order_size, rules.min_order_size) if v is not None]
@@ -511,23 +514,7 @@ def size_to_venue_minimum(amount, book: BookSnapshot, rules: MarketRules,
     configured_cap = _decimal(max_price, name="maximum buy price")
     cap = min(configured_cap, ONE - tick)
     cap = (cap / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
-    best = book.asks[0][0]
-    if best > cap or best <= ZERO:
-        return wanted
-    remaining_shares = minimum
-    notional = ZERO
-    for price, available in book.asks:
-        if price <= ZERO or price > cap:
-            break
-        take = remaining_shares if remaining_shares <= available else available
-        notional += take * price
-        remaining_shares -= take
-        if remaining_shares <= ZERO:
-            break
-    if remaining_shares > ZERO:
-        return wanted
-    required = notional.quantize(Decimal("0.01"), rounding=ROUND_UP)
-    return wanted if wanted >= required else required
+    return orderbook.venue_minimum_stake(wanted, book.asks, minimum, cap)
 
 
 def estimate_fok(book: BookSnapshot, amount, max_price,

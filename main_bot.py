@@ -145,43 +145,90 @@ def chainlink_signal(round_key: int, start_price, current_price):
 
 
 def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
-                        signal_observer=None) -> bool:
-    """Authorize one irreversible order step against the latest SIG PRICE.
+                        signal_observer=None, book_token: str | None = None,
+                        chainlink_start=None, explain=False):
+    """Authorize one irreversible order step against the latest signal.
 
     The executor calls this after its own blocking work (and again for each
-    live retry), so an order cannot outlive the Binance signal that selected
-    its side.  A missing/stale print, a round rollover, equality, or a flipped
+    live retry), so an order cannot outlive the signal that selected its
+    side.  A missing/stale print, a round rollover, equality, or a flipped
     side all fail closed.
+
+    Under SIGNAL_MINORITY_RULE the order side is chosen by a 3-signal vote
+    (see `_authority_side`), not SIG PRICE alone. When the caller supplies
+    `book_token` and `chainlink_start`, this permit recomputes that same vote
+    from freshly-sampled signals instead of comparing raw SIG PRICE against
+    `expected_side` - otherwise a genuine dissenting order would almost
+    always fail this check (SIG PRICE alone rarely equals the minority pick),
+    and a stale minority pick could slip through whenever SIG PRICE alone
+    happened to coincide with it.  Callers that never pass `book_token`
+    (phase 1 bands, which are price-only by design) keep the SIG-PRICE-only
+    behavior unchanged.
     """
+    def reject(reason):
+        return polymarket_trade.GuardRejection(reason) if explain else False
+
     if expected_side not in ("UP", "DOWN") or start_price is None:
-        return False
+        print(f"{_ts()} [GUARD] pre-submit refused: expected_side="
+              f"{expected_side!r} invalid or start_price missing.")
+        return reject("invalid order side or missing start price")
     try:
         sampled_wall = timer.unix()
         if timer.window_start(sampled_wall) != round_key:
             if signal_observer is not None:
                 signal_observer(None)
-            return False
+            print(f"{_ts()} [GUARD] pre-submit refused: round rolled over "
+                  f"before submission.")
+            return reject("round rolled over before submission")
         current_price, current_ts_ms = price_ws.fresh_snapshot(
             config.BTC_STALE_AFTER)
         if current_price is None or current_ts_ms is None:
             if signal_observer is not None:
                 signal_observer(None)
-            return False
+            print(f"{_ts()} [GUARD] pre-submit refused: BTC price feed is "
+                  f"stale (no sample within {config.BTC_STALE_AFTER}s).")
+            return reject("BTC price feed is stale")
         if timer.window_start(float(current_ts_ms) / 1000.0) != round_key:
             if signal_observer is not None:
                 signal_observer(None)
-            return False
+            print(f"{_ts()} [GUARD] pre-submit refused: freshest price "
+                  f"sample belongs to a different round than the order.")
+            return reject("price sample belongs to a different round")
         sampled_side = price_signal(round_key, start_price, current_price)
+        if config.SIGNAL_MINORITY_RULE and book_token is not None:
+            book_side = None
+            try:
+                bids, asks = orderbook.get_orderbook(book_token)
+                book_side = orderbook.liquidity_signal(bids, asks)
+            except Exception:
+                book_side = None
+            chainlink_side = chainlink_signal(
+                round_key, chainlink_start, current_chainlink_twap())
+            authority_side = _authority_side(sampled_side, book_side, chainlink_side)
+            if signal_observer is not None:
+                signal_observer(authority_side)
+            if authority_side != expected_side:
+                print(f"{_ts()} [GUARD] pre-submit refused: deciding signal "
+                      f"is now {authority_side or 'neutral/tied'}, order "
+                      f"wanted {expected_side} (price={sampled_side or 'n/a'} "
+                      f"book={book_side or 'n/a'} chainlink={chainlink_side or 'n/a'}).")
+            return (True if authority_side == expected_side else reject(
+                f"deciding signal is now {authority_side or 'neutral/tied'}, order wanted {expected_side}"))
         if signal_observer is not None:
             signal_observer(sampled_side)
-        return sampled_side == expected_side
-    except (TypeError, ValueError, OverflowError):
+        if sampled_side != expected_side:
+            print(f"{_ts()} [GUARD] pre-submit refused: SIG PRICE is now "
+                  f"{sampled_side or 'neutral'}, order wanted {expected_side}.")
+        return (True if sampled_side == expected_side else reject(
+            f"SIG PRICE is now {sampled_side or 'neutral'}, order wanted {expected_side}"))
+    except (TypeError, ValueError, OverflowError) as exc:
         if signal_observer is not None:
             try:
                 signal_observer(None)
             except Exception:
                 pass
-        return False
+        print(f"{_ts()} [GUARD] pre-submit refused: {type(exc).__name__}: {exc}")
+        return reject(f"signal validation failed: {type(exc).__name__}")
 
 
 def _fresh_signal_permit(source: str, expected_side: str, *, round_key: int,
@@ -610,6 +657,14 @@ async def run_bot():
             # both legs of the same market) and when we last attempted.
             held_tokens = set()
             last_phase1 = 0.0
+            # How many phase-2 entries have filled this round, regardless of
+            # side. TAPER_HEDGE_ENABLED reads this to decide whether the next
+            # confirmation still grows the primary side or now funds a hedge.
+            taper_count = 0
+            # The side entry 1 actually bought. Later slots in the SAME
+            # cycle anchor to this rather than to the live signal; a flip in
+            # the signal retires the cycle and re-anchors here instead.
+            taper_primary_side = None
             # Discovery answers the same question all round, so ask once.
             # Re-fetching per attempt cost 8 gamma calls a round, and
             # _fetch_slug retries twice at a 10s timeout: one bad call could
@@ -922,7 +977,7 @@ async def run_bot():
                 place_trade, side, config.BET_SIZE, up_id, down_id,
                 tokens["condition_id"], round_end, band_hi, min_price=band_lo,
                 pre_submit_guard=lambda: _fresh_price_permit(
-                    active_window, start_price, side,
+                    active_window, start_price, side, explain=True,
                     signal_observer=signal_epoch.observe))
             if ok:
                 round_exposure += entry_ceiling
@@ -1090,6 +1145,82 @@ async def run_bot():
                 f"ORDER SIDE={side}"
             )
 
+            # A repeating 3-confirmation cycle: two grow the primary side
+            # (tapering down, as one more agreement with an already-priced-in
+            # signal is weaker evidence than the first), the third buys the
+            # complement instead, funded by what would otherwise have kept
+            # piling onto an increasingly uncertain position - then the cycle
+            # restarts. Backtested against 111 real settled rounds before
+            # being wired in: capping the hedge at 1-in-3 instead of letting
+            # it run unbounded for the rest of the round turned +$1.50 total
+            # (the unbounded version) into +$71.10, because an unbounded
+            # hedge quietly inverts a long, correctly-held round into a loss.
+            #
+            # Every slot in the cycle - not just the hedge one - anchors to
+            # taper_primary_side (the side entry 1 actually bought) rather
+            # than to the live `side`, which is recomputed fresh from the
+            # signal every loop. Without that anchor the slots inside one
+            # cycle would each grow or hedge whatever the signal happened to
+            # say at that instant, instead of consistently building on the
+            # position already established.
+            #
+            # The anchor holds a cycle together; it does not outlive the
+            # signal that created it. The signal is what selects the trade,
+            # so when it flips away from the anchored side the cycle is
+            # retired and a new one starts from entry 1 on the new side -
+            # see the flip check below.
+            entry_amount = config.BET_SIZE
+            entry_side = side
+            is_taper_hedge = False
+            taper_anchor_side = None
+            taper_active = config.TAPER_HEDGE_ENABLED and mode == "PAPER"
+            if taper_active:
+                # Follow the signal. A cycle is a bet on one side; once the
+                # signal has left that side, continuing to grow it - or to
+                # buy its complement as a "hedge" for a position the bot no
+                # longer believes in - is acting on a decision that has
+                # already been withdrawn. So a flip retires the running
+                # cycle and begins a fresh one, from entry 1, on the side
+                # the signal now names. Shares already bought are left
+                # alone: this changes what happens next, not what filled.
+                if taper_primary_side is not None and side != taper_primary_side:
+                    print(f"{_ts()} [TAPER] Signal flipped "
+                          f"{taper_primary_side} -> {side} after "
+                          f"{taper_count} filled "
+                          f"{'entry' if taper_count == 1 else 'entries'}; "
+                          f"retiring that cycle and restarting on {side}.")
+                    taper_count = 0
+                    taper_primary_side = None
+                taper_anchor_side = taper_primary_side or side
+                cycle_pos = taper_count % 3
+                if cycle_pos == 0:
+                    entry_amount = config.TAPER_ENTRY1_USD
+                    entry_side = taper_anchor_side
+                elif cycle_pos == 1:
+                    entry_amount = config.TAPER_ENTRY2_USD
+                    entry_side = taper_anchor_side
+                else:
+                    entry_amount = config.TAPER_HEDGE_INCREMENT_USD
+                    entry_side = "DOWN" if taper_anchor_side == "UP" else "UP"
+                    is_taper_hedge = True
+
+            # The price band this particular order may fill in. A PRIMARY
+            # entry - the leg that follows the signal - may be held to a
+            # tighter band than the account allows; a taper hedge leg keeps
+            # the account bounds. Measured over 620 settled fills the two
+            # behave nothing alike: primary paid 0.577 for a 52% hit rate
+            # (edge -0.058), the hedge paid 0.418 for 54% (edge +0.118), and
+            # the 0.60-0.80 band alone carried 52% of turnover at -0.05 edge.
+            # See config.PRIMARY_ENTRY_MIN_PRICE for the full numbers.
+            #
+            # Both brokers may only TIGHTEN these per-order bounds against
+            # MIN/MAX_BUY_PRICE, never loosen them, so the hedge's band is
+            # exactly the account band - it cannot be widened from here.
+            entry_max_price = (config.MAX_BUY_PRICE if is_taper_hedge
+                               else config.PRIMARY_ENTRY_MAX_PRICE)
+            entry_min_price = (config.MIN_BUY_PRICE if is_taper_hedge
+                               else config.PRIMARY_ENTRY_MIN_PRICE)
+
             entry_ceiling = config.entry_cost_ceiling(config.MAX_BUY_PRICE)
             if round_exposure + entry_ceiling > config.MAX_ROUND_EXPOSURE + 1e-9:
                 print(
@@ -1166,24 +1297,54 @@ async def run_bot():
             final_price_side = price_signal(active_window, start_price, final_lp)
             final_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, final_cl)
-            signal_epoch.observe(_authority_side(
-                final_price_side, final_book_side, final_chainlink_side))
+            final_authority_side = _authority_side(
+                final_price_side, final_book_side, final_chainlink_side)
+            signal_epoch.observe(final_authority_side)
             _final_diagnostic_side = strategy.final_decision(
                 final_price_side, final_book_side, final_chainlink_side)
             if final_price_side is None:
                 print(f"{_ts()} [RISK] No order: SIG PRICE became neutral during validation.")
                 await asyncio.sleep(0.2)
                 continue
-            if final_price_side != side:
+            # Compare against the AUTHORITY side, not raw SIG PRICE: under
+            # SIGNAL_MINORITY_RULE `side` is the 3-signal minority vote, and
+            # comparing it to SIG PRICE alone rejects nearly every genuine
+            # dissenting order (SIG PRICE alone rarely equals the minority
+            # pick) while letting a stale minority pick through whenever
+            # SIG PRICE alone happens to coincide with it.
+            if final_authority_side != side:
                 print(
-                    f"{_ts()} [RISK] No order: SIG PRICE changed during validation "
-                    f"({side} -> {final_price_side})."
+                    f"{_ts()} [RISK] No order: deciding signal changed during "
+                    f"validation ({side} -> {final_authority_side})."
                 )
                 await asyncio.sleep(0.2)
                 continue
 
             other_token = down_id if side == "UP" else up_id
-            if other_token in held_tokens:
+            if taper_active:
+                if is_taper_hedge:
+                    # entry_side is the complement of taper_anchor_side (the
+                    # side entry 1 actually bought), not of the live `side`
+                    # above - see where entry_side was computed. Buying it
+                    # only makes sense if that anchored primary side actually
+                    # filled; if it didn't, there is nothing to hedge, so
+                    # this attempt is skipped rather than silently buying an
+                    # unrelated, unhedged complement position.
+                    primary_token = up_id if taper_anchor_side == "UP" else down_id
+                    if primary_token not in held_tokens:
+                        print(f"{_ts()} [RISK] No order: taper hedge has "
+                              f"nothing to hedge yet (primary side not "
+                              f"filled this round).")
+                        await _cooldown()
+                        continue
+                # else: this attempt grows the already-anchored primary side
+                # further. Whatever else this round holds - a hedge leg on
+                # the complement from an earlier cycle - is irrelevant here:
+                # this is not a fresh, possibly-accidental complement
+                # purchase, it is more of the same anchored position, so the
+                # "already hold the other leg" guard below (built for a
+                # different scenario: an unplanned pair) does not apply.
+            elif other_token in held_tokens:
                 flip_allowed = False
                 flip_detail = "PAPER signal-flip mode is disabled"
                 flips_enabled = (config.PAPER_ALLOW_SIGNAL_FLIPS if mode == "PAPER"
@@ -1383,27 +1544,40 @@ async def run_bot():
                 selected_bids, selected_asks = await asyncio.to_thread(
                     orderbook.validate_buy_liquidity,
                     selected_token,
-                    config.BET_SIZE, config.MAX_BUY_PRICE, config.MAX_ALLOWED_SPREAD,
-                    min_price=config.MIN_BUY_PRICE, book=reuse_book)
+                    entry_amount, entry_max_price, config.MAX_ALLOWED_SPREAD,
+                    min_price=entry_min_price, book=reuse_book)
             except ValueError as exc:
-                print(
-                    f"{_ts()} [RISK] No order this attempt: "
-                    f"{side} is not buyable - {exc}."
-                )
-                _append_trade(
-                    {
-                        "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
-                        "phase": "phase2",
-                        "side": side,
-                        "amount": config.BET_SIZE,
-                        "price_side": final_price_side or "",
-                        "book_side": final_book_side or "",
-                        "chainlink_side": final_chainlink_side or "",
-                        "result": "skipped_unfillable",
-                    }
-                )
-                await _cooldown()
-                continue
+                # This checks side's own buyability - the right gate for a
+                # plain entry, or a taper primary-slot one still on the live
+                # side. A taper hedge leg (or a primary-slot one anchored to
+                # a side the live signal has since left) targets entry_side,
+                # not side, so side failing this check says nothing about
+                # whether entry_side is buyable: the dedicated taper
+                # liquidity probe right before submission is the real gate
+                # for that order, and this failure is not fatal to it. The
+                # book read below is still wanted for the SIG BOOK diagnostic
+                # (unrelated to which side actually gets bought), so only a
+                # relevant failure aborts the whole attempt.
+                if entry_side == side:
+                    print(
+                        f"{_ts()} [RISK] No order this attempt: "
+                        f"{side} is not buyable - {exc}."
+                    )
+                    _append_trade(
+                        {
+                            "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
+                            "phase": "phase2",
+                            "side": entry_side,
+                            "amount": entry_amount,
+                            "price_side": final_price_side or "",
+                            "book_side": final_book_side or "",
+                            "chainlink_side": final_chainlink_side or "",
+                            "result": "skipped_unfillable",
+                        }
+                    )
+                    await _cooldown()
+                    continue
+                selected_bids, selected_asks = (), ()
             except Exception as exc:
                 print(f"{_ts()} [MARKET] Liquidity probe failed: {type(exc).__name__}: {exc}")
                 await _cooldown(1.0)
@@ -1442,19 +1616,24 @@ async def run_bot():
                 if side == "UP" else final_book_side
             )
             submit_price_side = price_signal(active_window, start_price, submit_lp)
-            signal_epoch.observe(submit_price_side)
             submit_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, submit_cl)
+            submit_authority_side = _authority_side(
+                submit_price_side, submit_book_side, submit_chainlink_side)
+            signal_epoch.observe(submit_authority_side)
             _submit_diagnostic_side = strategy.final_decision(
                 submit_price_side, submit_book_side, submit_chainlink_side)
             if submit_price_side is None:
                 print(f"{_ts()} [RISK] No order: SIG PRICE is neutral immediately before submission.")
                 await asyncio.sleep(0.2)
                 continue
-            if submit_price_side != side:
+            # See the final-validation guard above: compare the AUTHORITY
+            # side, not raw SIG PRICE, so this check means the same thing
+            # under SIGNAL_MINORITY_RULE as it does in the default mode.
+            if submit_authority_side != side:
                 print(
-                    f"{_ts()} [RISK] No order: SIG PRICE changed immediately before "
-                    f"submission ({side} -> {submit_price_side})."
+                    f"{_ts()} [RISK] No order: deciding signal changed immediately "
+                    f"before submission ({side} -> {submit_authority_side})."
                 )
                 await asyncio.sleep(0.2)
                 continue
@@ -1489,20 +1668,64 @@ async def run_bot():
                 await _cooldown()
                 continue
 
+            # entry_side can differ from side above - a hedge leg always
+            # targets the complement, and an anchored primary-slot entry
+            # (cycle 2+) stays on taper_anchor_side even if the live signal
+            # has since wobbled to the other side. Either way, the earlier
+            # liquidity probe validated side's own token, not necessarily
+            # the one about to be submitted, so it is checked fresh here,
+            # right before submission, same as any other pre-submit probe.
+            if entry_side != side:
+                order_token = up_id if entry_side == "UP" else down_id
+                try:
+                    await asyncio.to_thread(
+                        orderbook.validate_buy_liquidity,
+                        order_token,
+                        entry_amount, entry_max_price, config.MAX_ALLOWED_SPREAD,
+                        min_price=entry_min_price)
+                except ValueError as exc:
+                    print(
+                        f"{_ts()} [RISK] No order this attempt: "
+                        f"{entry_side} is not buyable - {exc}."
+                    )
+                    await _cooldown()
+                    continue
+                except Exception as exc:
+                    print(f"{_ts()} [MARKET] Taper liquidity probe failed: "
+                          f"{type(exc).__name__}: {exc}")
+                    await _cooldown(1.0)
+                    continue
+
             verb = "Simulating live-book FOK" if mode == "PAPER" else "Placing trade"
-            print(f"{_ts()} [BOT] {verb}: {side} ${config.BET_SIZE}")
+            tag = " [TAPER HEDGE]" if is_taper_hedge else ""
+            print(f"{_ts()} [BOT]{tag} {verb}: {entry_side} ${entry_amount}")
             ok = await asyncio.to_thread(
-                place_trade, side, config.BET_SIZE, up_id, down_id,
+                place_trade, entry_side, entry_amount, up_id, down_id,
                 tokens["condition_id"], round_end,
+                entry_max_price, entry_min_price,
                 pre_submit_guard=lambda: _fresh_price_permit(
-                    active_window, start_price, side,
-                    signal_observer=signal_epoch.observe))
+                    active_window, start_price, side, explain=True,
+                    signal_observer=signal_epoch.observe,
+                    # Recompute SIG BOOK from its original reference token.
+                    # The execution token can be DOWN; its depth is not the
+                    # UP-oriented vote that selected this order.
+                    book_token=ob_id,
+                    chainlink_start=start_chainlink_price))
             if ok:
                 round_exposure += entry_ceiling
+                if taper_active and taper_count == 0:
+                    # Lock in what entry 1 actually bought - every later
+                    # taper decision this round (including which side any
+                    # hedge targets) anchors to this, not a live signal that
+                    # can keep moving after the position is already built.
+                    taper_primary_side = entry_side
+                taper_count += 1
                 # Shared with phase 1 and durable restart recovery. LIVE and
                 # default PAPER block the complement; the explicit PAPER
-                # experiment consults the accepted-side epoch above.
-                held_tokens.add(up_id if side == "UP" else down_id)
+                # experiment consults the accepted-side epoch above. A taper
+                # hedge fill marks its own (complement) token held, same as
+                # any other accepted leg.
+                held_tokens.add(up_id if entry_side == "UP" else down_id)
                 signal_epoch.record_accepted(side)
                 if mode == "PAPER":
                     result = "paper_filled"
@@ -1528,9 +1751,9 @@ async def run_bot():
             _append_trade(
                 {
                     "time_et": now_et().strftime("%b %d %H:%M:%S ET"),
-                    "phase": "phase2",
-                    "side": side,
-                    "amount": config.BET_SIZE,
+                    "phase": "phase2-hedge" if is_taper_hedge else "phase2",
+                    "side": entry_side,
+                    "amount": entry_amount,
                     "price_side": price_side or "",
                     "book_side": book_side or "",
                     "chainlink_side": chainlink_side or "",

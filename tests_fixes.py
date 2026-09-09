@@ -361,6 +361,98 @@ async def t_rtds_subscription_matches_the_documented_contract():
           json.loads(sub["filters"]) == {"symbol": "btc/usd"}, str(sub))
 
 
+async def t_rtds_close_reports_code_and_reason_not_a_generic_message():
+    """A dead RTDS socket must say WHY, not just that something broke.
+
+    The custom send-side heartbeat this module replaced (see
+    t_rtds_subscription_matches_the_documented_contract for the protocol-
+    ping rewrite) used to log a distinct "heartbeat send/close failed"
+    message on a half-open socket. The protocol-level ping/pong keepalive
+    that replaced it detects the same class of dead connection, but nothing
+    reported WHY the connection ended beyond whatever generic message
+    _run()'s outer `except Exception` produced. This checks that a
+    ConnectionClosed's code/reason reach `last_error`, and that _run()'s
+    generic handler does not clobber that specific message with a less
+    informative one.
+    """
+    from websockets.exceptions import ConnectionClosed
+    from websockets.frames import Close
+
+    class FakeWS:
+        async def send(self, _payload):
+            pass
+
+        async def recv(self):
+            raise ConnectionClosed(Close(1011, "keepalive ping timed out"), None)
+
+    class FakeContext:
+        async def __aenter__(self):
+            return FakeWS()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    original = strike_mod.websockets.connect
+    strike_mod.websockets.connect = lambda *_a, **_kw: FakeContext()
+    try:
+        direct = ChainlinkStrike()
+        try:
+            await direct._session()
+            check("_session raises ConnectionClosed rather than swallowing it", False)
+        except ConnectionClosed:
+            pass
+        check("the close code and reason reach last_error",
+              "code=1011" in (direct.last_error or "")
+              and "keepalive ping timed out" in (direct.last_error or ""),
+              str(direct.last_error))
+
+        via_run = ChainlinkStrike()
+        task = asyncio.ensure_future(via_run._run())
+        try:
+            await asyncio.sleep(0.05)  # let the first failed attempt run
+            check("_run()'s generic handler keeps the specific diagnostic",
+                  "code=1011" in (via_run.last_error or "")
+                  and "keepalive ping timed out" in (via_run.last_error or ""),
+                  str(via_run.last_error))
+        finally:
+            via_run._stop.set()
+            await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        strike_mod.websockets.connect = original
+
+
+def t_live_venue_minimum_sizing_matches_paper():
+    """paper_trade and polymarket_trade must size identically off one walk.
+
+    Both used to hand-implement the same "walk the ask ladder up to the
+    venue minimum" logic independently, with polymarket_trade's docstring
+    admitting it only "mirrors" the paper copy rather than sharing it - a
+    correction to one could silently not apply to the other. Both now
+    delegate to orderbook.venue_minimum_stake; this checks polymarket_trade
+    against the exact thin-book scenario tests_paper.py locks in for the
+    paper path (a 3-share top level, the rest at the next tick), so a future
+    change to the shared walk that breaks parity fails here too.
+    """
+    import polymarket_trade
+
+    asks = [{"price": "0.50", "size": "3"}, {"price": "0.51", "size": "10"}]
+    sized = polymarket_trade._size_to_venue_minimum(
+        2.50, asks, {"minimum": "5"}, 0.90)
+    # Cross-checked against paper_trade.size_to_venue_minimum's own published
+    # result for the identical book (tests_paper.py t_paper_sizes_up_when_
+    # top_of_book_cannot_fill_the_minimum: $2.50 -> $2.52).
+    check("live sizing raises exactly to the venue minimum notional",
+          abs(sized - 2.52) < 1e-9, str(sized))
+
+    # An unreadable market must never silently enlarge a live order.
+    check("malformed rules leave the amount unchanged",
+          polymarket_trade._size_to_venue_minimum(
+              2.50, asks, {"minimum": "not-a-number"}, 0.90) == 2.50)
+    check("no asks leaves the amount unchanged",
+          polymarket_trade._size_to_venue_minimum(
+              2.50, [], {"minimum": "5"}, 0.90) == 2.50)
+
+
 def t_market_tokens_are_mapped_by_outcome_and_tradeability():
     event = {
         "slug": "btc-updown-5m-12300",
@@ -670,6 +762,42 @@ def t_unbuyable_side_is_refused_before_submission():
                    [{"price": "0.50", "size": "100"}], min_price=0.20) is None)
     finally:
         orderbook.get_orderbook = original
+
+
+def t_http_pool_split_timeout_respects_a_caller_larger_than_the_floor():
+    """A caller's explicit timeout must not be silently truncated at connect.
+
+    _split_timeout used to return (min(HTTP_CONNECT_TIMEOUT_SECONDS, read),
+    read) - so orderbook.py's timeout=8.0 and market_discovery.py's
+    timeout=10 both got their connect phase hard-capped at the configured
+    floor (4.0 by default) no matter what they asked for, even though the
+    module's own warm() docstring measures real connect times up to 15.8s.
+    """
+    import config
+    import http_pool
+
+    floor = config.HTTP_CONNECT_TIMEOUT_SECONDS
+    check("a timeout under the floor is left untouched on both phases",
+          http_pool._split_timeout(floor / 2.0) == (floor / 2.0, floor / 2.0))
+    check("a timeout exactly at the floor is left untouched",
+          http_pool._split_timeout(floor) == (floor, floor))
+
+    connect, read = http_pool._split_timeout(floor * 2.0)
+    check("a caller asking for double the floor gets at least the floor on connect",
+          connect >= floor, str(connect))
+    check("connect+read stays close to what the caller asked for",
+          abs((connect + read) - floor * 2.0) < 1e-9, str((connect, read)))
+
+    connect, read = http_pool._split_timeout(10.0)
+    check("a much larger caller timeout is never truncated back to the floor",
+          connect > floor, str(connect))
+    check("read never collapses to zero for a large caller timeout",
+          read > 0, str(read))
+
+    check("an explicit (connect, read) pair passes through untouched",
+          http_pool._split_timeout((1.5, 9.0)) == (1.5, 9.0))
+    check("no timeout at all still uses the configured connect floor",
+          http_pool._split_timeout(None) == (floor, None))
 
 
 def t_orderbook_rejects_nonfinite_controls_before_network_io():
@@ -993,13 +1121,18 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   diagnostic_side="DOWN",
                                   stop_after_vote=None,
                                   stop_after_orders=1,
-                                  allow_signal_flips=False):
+                                  allow_signal_flips=False,
+                                  taper_hedge_enabled=False, token_books=None,
+                                  liquidity_probe=None, primary_band=None):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
     active = 1_786_320_000
     seen = {"orders": 0, "probes": 0, "price_votes": 0, "order_sides": [],
-            "executor_guards": []}
+            "order_amounts": [], "executor_guards": [],
+            # (max_price, min_price) actually handed to each submission and
+            # to each liquidity probe - the band that order may fill in.
+            "order_bands": [], "probe_bands": []}
     votes = list(price_votes or ())
     bids, asks = _book(0.50)
 
@@ -1022,6 +1155,12 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
             return False
         seen["orders"] += 1
         seen["order_sides"].append(side)
+        seen["order_amounts"].append(_args[0] if _args else None)
+        # place_trade(side, amount, up, down, condition, window_end,
+        #             max_price, min_price, *, pre_submit_guard)
+        seen["order_bands"].append(
+            (_args[5] if len(_args) > 5 else kwargs.get("max_price"),
+             _args[6] if len(_args) > 6 else kwargs.get("min_price")))
         if (stop_after_orders is not None
                 and seen["orders"] >= stop_after_orders):
             main_bot.stop_event.set()
@@ -1037,6 +1176,10 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
 
     def probe(*_args, **_kwargs):
         seen["probes"] += 1
+        # validate_buy_liquidity(token, amount, max_price, spread, min_price=)
+        seen["probe_bands"].append(
+            (_args[2] if len(_args) > 2 else _kwargs.get("max_price"),
+             _kwargs.get("min_price")))
         return bids, asks
 
     saved = []
@@ -1065,10 +1208,13 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
             "up_token_id": "11", "down_token_id": "12",
             "orderbook_token_id": "11", "condition_id": "0x" + "a" * 64,
         })
-        replace(main_bot.orderbook, "get_orderbook", lambda *_a, **_k: (bids, asks))
-        replace(main_bot.orderbook, "liquidity_signal",
-                lambda *_a, **_k: book_vote)
-        replace(main_bot.orderbook, "validate_buy_liquidity", probe)
+        replace(main_bot.orderbook, "get_orderbook",
+                lambda token, *_a, **_k: token_books[str(token)] if token_books else (bids, asks))
+        if token_books is None:
+            replace(main_bot.orderbook, "liquidity_signal",
+                    lambda *_a, **_k: book_vote)
+        replace(main_bot.orderbook, "validate_buy_liquidity",
+                liquidity_probe if liquidity_probe is not None else probe)
         replace(main_bot.strategy, "decide", lambda *_a, **_k: "DOWN")
         replace(main_bot.strategy, "final_decision",
                 lambda *_a, **_k: diagnostic_side)
@@ -1092,6 +1238,10 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "CANCEL_OPEN_BEFORE_TRADE", False)
         replace(main_bot.config, "PAPER_ALLOW_SIGNAL_FLIPS", allow_signal_flips)
         replace(main_bot.config, "SIGNAL_MINORITY_RULE", minority_rule)
+        replace(main_bot.config, "TAPER_HEDGE_ENABLED", taper_hedge_enabled)
+        if primary_band is not None:
+            replace(main_bot.config, "PRIMARY_ENTRY_MIN_PRICE", primary_band[0])
+            replace(main_bot.config, "PRIMARY_ENTRY_MAX_PRICE", primary_band[1])
         main_bot.stop_event.clear()
         with contextlib.redirect_stdout(io.StringIO()):
             with contextlib.suppress(asyncio.TimeoutError):
@@ -1326,6 +1476,323 @@ async def t_phase2_minority_rule_revalidates_the_deciding_side():
         stop_after_vote=2)
     check("changed minority decision blocks the stale order side",
           changed["orders"] == 0, str(changed))
+
+
+async def t_phase2_guard_uses_signal_book_for_down_orders():
+    # The UP book votes UP and the complementary DOWN book votes DOWN.
+    # Stable price=UP/book=UP/chainlink=DOWN selects minority DOWN.
+    # Reading DOWN's depth as the global book vote would falsely flip it UP.
+    books = {
+        "11": ([{"price": "0.49", "size": "80"}],
+               [{"price": "0.50", "size": "40"}]),
+        "12": ([{"price": "0.49", "size": "40"}],
+               [{"price": "0.50", "size": "80"}]),
+    }
+    for mode in ("PAPER", "LIVE"):
+        stable = await _drive_phase2_with_hold(
+            execution_mode=mode, held_provider=lambda *_a: set(),
+            price_votes=("UP",) * 4, chainlink_vote="DOWN",
+            minority_rule=True, token_books=books)
+        check(f"{mode} valid DOWN order passes with complementary books",
+              stable["order_sides"] == ["DOWN"]
+              and stable["executor_guards"] == [True], str(stable))
+        changed = await _drive_phase2_with_hold(
+            execution_mode=mode, held_provider=lambda *_a: set(),
+            price_votes=("UP", "UP", "UP", "DOWN"), chainlink_vote="DOWN",
+            minority_rule=True, token_books=books)
+        check(f"{mode} actual signal change at commit still rejects",
+              changed["orders"] == 0 and len(changed["executor_guards"]) == 1
+              and changed["executor_guards"][0] is not True, str(changed))
+
+
+def t_pre_submit_guard_explains_why_it_refused():
+    """The console must say WHY, not just 'pre-submit guard rejected order'.
+
+    That generic string comes from paper_trade._pre_submit_guard_error and
+    can't carry a reason - the guard is a plain bool-returning callable. The
+    fix is _fresh_price_permit printing its own diagnostic on every refusal
+    path, so an operator watching the console can tell a round rollover from
+    a stale feed from a genuine signal reversal instead of guessing.
+    """
+    import main_bot
+
+    saved = []
+
+    def replace(obj, name, value):
+        saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    round_key = 1_786_320_000
+    try:
+        replace(main_bot.timer, "unix", lambda *_a, **_k: round_key + 100.0)
+        replace(main_bot.timer, "window_start",
+                lambda ts=None: round_key if ts is None or ts < round_key + 300
+                else round_key + 300)
+        replace(main_bot.price_ws, "fresh_snapshot",
+                lambda *_a, **_k: (101.0, (round_key + 100) * 1000))
+        replace(main_bot, "price_signal", lambda *_a, **_k: "DOWN")
+        replace(main_bot, "chainlink_signal", lambda *_a, **_k: "UP")
+        replace(main_bot, "current_chainlink_twap", lambda: 101.0)
+        replace(main_bot.orderbook, "get_orderbook", lambda *_a, **_k: ((), ()))
+        replace(main_bot.orderbook, "liquidity_signal", lambda *_a, **_k: "UP")
+        replace(main_bot.config, "SIGNAL_MINORITY_RULE", True)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            # price=DOWN, book=UP, chainlink=UP -> unanimous-ish majority UP,
+            # so the minority (authority) side is DOWN... wait: 1 DOWN vs 2 UP
+            # is a majority, so minority_decision picks the DISSENTER, DOWN.
+            # Expecting UP here forces a mismatch against the actual minority
+            # pick (DOWN), which is exactly the "signal changed" scenario.
+            allowed = main_bot._fresh_price_permit(
+                round_key, 100.0, "UP", book_token="tok",
+                chainlink_start=100.0)
+        out = buf.getvalue()
+        check("mismatched authority side is refused", allowed is False)
+        check("the console explains it was a deciding-signal mismatch, "
+              "not a generic string",
+              "deciding signal is now" in out and "wanted UP" in out, out)
+
+        # Round rollover: sampled wall is past the round's own window.
+        replace(main_bot.timer, "unix", lambda *_a, **_k: round_key + 400.0)
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            allowed2 = main_bot._fresh_price_permit(
+                round_key, 100.0, "UP", book_token="tok",
+                chainlink_start=100.0)
+        out2 = buf2.getvalue()
+        check("a rolled-over round is refused", allowed2 is False)
+        check("the console names the round rollover specifically",
+              "round rolled over" in out2, out2)
+    finally:
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+
+
+async def t_taper_hedge_grows_primary_then_hedges_the_complement():
+    """PAPER-only: $3, then $2, then $1-to-the-complement, per confirmation.
+
+    Backtested (see the entry-cap analysis) against 102 real settled rounds
+    before being wired in. This locks in the mechanics: the first two
+    confirmations still grow the primary side at a tapering size, the third
+    onward buys the complement instead, the flag defaults off with no
+    behavior change, and it stays inert in LIVE regardless of the flag.
+    """
+    tapered = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 20, stop_after_orders=3,
+        taper_hedge_enabled=True, timeout=2.0)
+    check("first two confirmations still grow the primary side",
+          tapered["order_sides"][:2] == ["UP", "UP"], str(tapered))
+    check("the third confirmation buys the complement instead",
+          tapered["order_sides"][2] == "DOWN", str(tapered))
+    check("amounts taper $3 -> $2 -> $1",
+          [round(a, 2) for a in tapered["order_amounts"]] == [3.0, 2.0, 1.0],
+          str(tapered["order_amounts"]))
+
+    off = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 20, stop_after_orders=3,
+        taper_hedge_enabled=False, timeout=2.0)
+    check("default behavior (flag off) is unchanged: flat amount, same side",
+          off["order_sides"] == ["UP", "UP", "UP"], str(off["order_sides"]))
+    check("no tapering when the flag is off",
+          len({round(a, 2) for a in off["order_amounts"]}) == 1,
+          str(off["order_amounts"]))
+
+    # One order is enough to prove inertness: a LIVE fill trips this test
+    # harness's own "unjournaled order" safety stop after any single order
+    # (last_order_receipt is never set by the fake place_trade this harness
+    # installs), so asking for a 2nd/3rd here would test that unrelated
+    # harness limitation, not taper-hedge.
+    live = await _drive_phase2_with_hold(
+        execution_mode="LIVE", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 8, stop_after_orders=1,
+        taper_hedge_enabled=True, timeout=1.0)
+    check("TAPER_HEDGE_ENABLED is inert in LIVE regardless of the flag",
+          live["order_sides"] == ["UP"], str(live["order_sides"]))
+    import config as _config
+    check("LIVE amount stays at plain BET_SIZE even with the flag on",
+          live["order_amounts"][0] == _config.BET_SIZE, str(live["order_amounts"]))
+
+
+async def t_taper_hedge_cycle_repeats_and_restarts_when_the_signal_flips():
+    """The 3-confirmation cycle repeats, and follows the signal when it flips.
+
+    Backtested: an unbounded hedge (grow twice, then hedge every
+    confirmation for the rest of the round) turned +$1.50 total into a much
+    better +$71.10 once capped at 1-in-3 and repeated - an unbounded hedge
+    quietly inverts a long, correctly-held round into a loss. So while the
+    signal holds, two full cycles must land on the right slot at the right
+    size (UP, UP, DOWN, UP, UP, DOWN at $3, $2, $1 each time).
+
+    A cycle is a bet on one side, though, and the signal is what selects it.
+    Once the signal leaves that side, growing it further - or buying its
+    complement as a "hedge" for a position the bot no longer believes in -
+    acts on a decision that has already been withdrawn. So a flip retires
+    the running cycle and starts a fresh one, from entry 1, on the new side.
+
+    The harness draws four price samples per order, so votes are sequenced
+    to land the flip on a chosen slot. (The earlier version of this test
+    flipped at sample 16 while asserting over 4 orders = 16 samples, so its
+    DOWN votes were never reached and its wobble assertions passed against
+    a signal that had in fact stayed UP throughout.)
+    """
+    stable = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, stop_after_orders=6,
+        taper_hedge_enabled=True, timeout=3.0)
+    check("two full cycles land UP, UP, DOWN, UP, UP, DOWN",
+          stable["order_sides"] == ["UP", "UP", "DOWN", "UP", "UP", "DOWN"],
+          str(stable))
+    check("amounts taper $3, $2, $1 each cycle, not just the first",
+          [round(a, 2) for a in stable["order_amounts"]]
+          == [3.0, 2.0, 1.0, 3.0, 2.0, 1.0],
+          str(stable["order_amounts"]))
+
+    # Flip on the slot that would otherwise have been the $1 hedge.
+    mid = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 8 + ("DOWN",) * 60, stop_after_orders=4,
+        taper_hedge_enabled=True, timeout=3.0)
+    check("entries 1-2 grow the side the signal confirmed first",
+          mid["order_sides"][:2] == ["UP", "UP"]
+          and [round(a, 2) for a in mid["order_amounts"][:2]] == [3.0, 2.0],
+          str(mid))
+    check("the flip restarts the cycle on DOWN at entry-1 size, rather "
+          "than hedging DOWN at $1 to protect a withdrawn UP call",
+          mid["order_sides"][2] == "DOWN"
+          and round(mid["order_amounts"][2], 2) == 3.0, str(mid))
+    check("the new cycle then continues on DOWN instead of resuming UP",
+          mid["order_sides"][3] == "DOWN"
+          and round(mid["order_amounts"][3], 2) == 2.0, str(mid))
+
+    # Flip immediately after entry 1, and let the NEW cycle run to its own
+    # hedge slot: a restart starts a real cycle, not a one-off re-entry.
+    early = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 4 + ("DOWN",) * 60, stop_after_orders=4,
+        taper_hedge_enabled=True, timeout=3.0)
+    check("a flip one entry in restarts on DOWN at entry-1 size",
+          early["order_sides"][:2] == ["UP", "DOWN"]
+          and [round(a, 2) for a in early["order_amounts"][:2]] == [3.0, 3.0],
+          str(early))
+    check("the restarted cycle keeps its own shape: $2 grow, then a $1 "
+          "hedge on the complement of the side it is now built on",
+          early["order_sides"][2:] == ["DOWN", "UP"]
+          and [round(a, 2) for a in early["order_amounts"][2:]] == [2.0, 1.0],
+          str(early))
+
+
+async def t_primary_entries_are_price_banded_but_hedge_legs_are_not():
+    """A primary entry may be held to a tighter band than the hedge leg.
+
+    Measured over 620 settled fills the two leg types are priced completely
+    differently for almost the same hit rate - primary paid 0.577 for a 52%
+    hit rate (edge -0.058), the hedge paid 0.418 for 54% (edge +0.118) - and
+    the 0.60-0.80 band alone carried 52% of turnover at about -0.05 edge. So
+    the ceiling belongs on the leg that follows the signal, while the hedge
+    stays on the account bounds: its edge is largest in exactly the cheap
+    buckets a shared floor would forbid.
+
+    The band must reach the ORDER, not only the probe. The broker walks the
+    book, so a probe that passed at the band's top says nothing about where
+    the fill actually lands; both paths are checked.
+    """
+    import main_bot
+    band = (0.25, 0.80)                     # (min, max) for primary entries
+    acct = (main_bot.config.MAX_BUY_PRICE, main_bot.config.MIN_BUY_PRICE)
+
+    run = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, stop_after_orders=3,
+        taper_hedge_enabled=True, primary_band=band, timeout=3.0)
+
+    check("the cycle ran two primaries then a hedge",
+          run["order_sides"] == ["UP", "UP", "DOWN"], str(run["order_sides"]))
+    check("both primary entries are submitted inside the primary band",
+          run["order_bands"][:2] == [(0.80, 0.25), (0.80, 0.25)],
+          str(run["order_bands"]))
+    check("the hedge leg is submitted on the ACCOUNT band, not the primary one",
+          run["order_bands"][2] == acct,
+          f"{run['order_bands'][2]} vs account {acct}")
+    check("the liquidity probe asks about the band it will submit under",
+          (0.80, 0.25) in run["probe_bands"], str(run["probe_bands"][:4]))
+
+    # Left at the account band the feature is inert - existing behaviour.
+    plain = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, stop_after_orders=2,
+        taper_hedge_enabled=True, primary_band=(acct[1], acct[0]), timeout=3.0)
+    check("band defaulted to the account band changes nothing",
+          all(b == acct for b in plain["order_bands"]),
+          str(plain["order_bands"]))
+
+
+def t_primary_entry_band_may_only_tighten_the_account_band():
+    """Config refuses a band the brokers would silently ignore.
+
+    Both brokers clamp a per-order bound to the account band (tighten-only),
+    so a PRIMARY_ENTRY_MAX_PRICE above MAX_BUY_PRICE would read as configured
+    and do nothing at all. Failing loudly at import beats that.
+    """
+    ok = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
+                        PRIMARY_ENTRY_MIN_PRICE="0.15",
+                        PRIMARY_ENTRY_MAX_PRICE="0.80")
+    check("a band inside the account band is accepted", ok is None, str(ok))
+
+    loose_max = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
+                               PRIMARY_ENTRY_MAX_PRICE="0.95")
+    check("a ceiling above MAX_BUY_PRICE is refused",
+          "PRIMARY_ENTRY_MAX_PRICE" in (loose_max or ""), str(loose_max))
+
+    loose_min = _reload_config(MIN_BUY_PRICE="0.20", MAX_BUY_PRICE="0.90",
+                               PRIMARY_ENTRY_MIN_PRICE="0.05")
+    check("a floor below MIN_BUY_PRICE is refused",
+          "PRIMARY_ENTRY_MIN_PRICE" in (loose_min or ""), str(loose_min))
+
+    inverted = _reload_config(MIN_BUY_PRICE="0.10", MAX_BUY_PRICE="0.90",
+                              PRIMARY_ENTRY_MIN_PRICE="0.85",
+                              PRIMARY_ENTRY_MAX_PRICE="0.80")
+    check("a floor above its own ceiling is refused",
+          "below PRIMARY_ENTRY_MAX_PRICE" in (inverted or ""), str(inverted))
+
+
+async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():
+    """A hedge leg must not die because the PRIMARY side's book blipped.
+
+    The early liquidity probe (well before the taper decision) checks
+    side's own token - the right gate for a plain entry, but irrelevant to
+    a hedge leg, which targets the complement. Found while investigating a
+    live report of a flat, un-tapered $2.5 entry: that probe was still
+    checking config.BET_SIZE on side's token regardless of what was about
+    to actually be submitted. This simulates side's own book failing the
+    check right as the hedge slot comes up (entries 1-2 succeed normally,
+    then UP's liquidity blips) and checks the hedge still goes through on
+    DOWN, which was never at issue.
+    """
+    calls = {"11": 0}
+
+    def flaky_probe(token, *_a, **_k):
+        token = str(token)
+        if token == "11":  # up_token_id in this harness
+            calls["11"] += 1
+            if calls["11"] > 2:
+                raise ValueError("simulated liquidity blip on the primary side")
+        return (), ()
+
+    result = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 20, stop_after_orders=3,
+        taper_hedge_enabled=True, liquidity_probe=flaky_probe, timeout=3.0)
+    check("entries 1-2 still fill normally before the blip",
+          result["order_sides"][:2] == ["UP", "UP"], str(result))
+    check("the hedge leg still fills despite the primary side's own "
+          "liquidity check failing - it was never buying that side",
+          result["order_sides"][2:] == ["DOWN"], str(result))
+    check("amounts still taper correctly through the blip",
+          [round(a, 2) for a in result["order_amounts"]] == [3.0, 2.0, 1.0],
+          str(result["order_amounts"]))
 
 
 async def t_paper_signal_flip_mode_keeps_repeats_and_allows_verified_flip():
@@ -1997,6 +2464,21 @@ def t_ctrl_c_is_a_clean_exit_not_a_traceback():
     check("Ctrl+C drains leftover tasks", code == 130, str(code))
     check("Ctrl+C leaves no pending-task warning",
           "Task was destroyed but it is pending" not in err, err)
+
+
+def t_guard_rejection_reason_reaches_both_brokers():
+    import main_bot
+    import paper_trade
+    import polymarket_trade
+    for helper in (paper_trade._pre_submit_guard_error,
+                   polymarket_trade._pre_submit_guard_error):
+        reason = helper(lambda: main_bot._fresh_price_permit(
+            0, None, "UP", explain=True))
+        check("broker preserves explicit refusal reason",
+              reason == "pre-submit guard rejected order: invalid order side or missing start price",
+              str(reason))
+        check("guard still requires literal True", helper(lambda: 1) is not None)
+        check("valid guard still passes", helper(lambda: True) is None)
 
 
 def main():

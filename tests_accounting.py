@@ -728,6 +728,51 @@ def t_late_fill_after_settlement_reopens():
         os.path.exists(path) and os.unlink(path)
 
 
+def t_reload_rejects_fabricated_realized_from_sales():
+    """A sell-to-close position must cross-check realized_from_sales vs lots.
+
+    Reload validation used to check a settled sell-to-close position (payout
+    is None) only against ITSELF - realized == realized_from_sales - never
+    against what its recorded SELL lots actually paid out. A hand-edited or
+    corrupted ledger.json could carry any matching pair of fabricated
+    realized/realized_from_sales values and load cleanly. This builds a real
+    buy-then-fully-sell position, tampers with both fields on disk (keeping
+    them equal to each other, exactly as the old check required), and expects
+    the reload to now fail closed.
+    """
+    led, path = _ledger()
+    try:
+        led.allow_sells = True
+        led.record_fill("t1", UP_TOK, shares=4.0, price=0.50, condition_id=COND)
+        led.record_fill("t2", UP_TOK, shares=4.0, price=0.60, side="SELL",
+                        condition_id=COND)
+        pos = led.positions[UP_TOK]
+        check("fully sold position closes itself", pos.settled and pos.shares == 0.0)
+        real_realized = pos.realized_from_sales
+        check("test setup actually banked a nonzero realized PnL",
+              abs(real_realized) > 1e-6, str(real_realized))
+        check("ledger saves", led.save())
+
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        entry = data["positions"][UP_TOK]
+        fabricated = real_realized + 1.0
+        entry["realized_from_sales"] = fabricated
+        entry["realized"] = fabricated
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+        try:
+            Ledger(path=path)
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        check("a fabricated-but-self-consistent realized_from_sales is rejected",
+              rejected)
+    finally:
+        os.path.exists(path) and os.unlink(path)
+
+
 # ------------------------------------------------------------- settlement --
 async def t_settlement_worker():
     led, path = _ledger()

@@ -1296,6 +1296,49 @@ def _reject_json_constant(value: str):
     raise ValueError(f"non-finite JSON constant {value}")
 
 
+def _replay_realized_from_sales(position: "Position") -> float:
+    """Independently recompute realized_from_sales from the lot journal.
+
+    `Position.realized_from_sales` is trusted at load time rather than
+    derived, so a corrupted or hand-edited file can carry any number there as
+    long as it stays self-consistent with `realized` - a settled sell-to-close
+    position, for example, only checked `realized == realized_from_sales`
+    against itself, never against what the recorded SELL lots actually paid
+    out. This replays the same oldest-lot-first FIFO consumption
+    `_consume_fifo` performs live, off a private per-lot open-shares counter
+    so it never mutates the lots it is validating, and returns the total
+    proceeds-minus-basis a faithful replay would produce.
+    """
+    open_shares: dict[int, float] = {
+        i: lot.shares for i, lot in enumerate(position.lots)
+        if str(lot.side or "").upper() == "BUY"
+    }
+    realized = 0.0
+    for lot in position.lots:
+        if str(lot.side or "").upper() != "SELL":
+            continue
+        remaining = lot.shares
+        notional = fees = 0.0
+        for j, buy_lot in enumerate(position.lots):
+            if remaining <= 1e-12:
+                break
+            if str(buy_lot.side or "").upper() != "BUY":
+                continue
+            avail = open_shares.get(j, 0.0)
+            if avail <= 1e-12:
+                continue
+            take = min(avail, remaining)
+            fee_per_share = (buy_lot.fee / buy_lot.shares) if buy_lot.shares else 0.0
+            notional += take * buy_lot.price
+            fees += take * fee_per_share
+            open_shares[j] = avail - take
+            remaining -= take
+        basis = notional + fees
+        proceeds = lot.shares * lot.price - lot.fee
+        realized += proceeds - basis
+    return realized
+
+
 def _validate_loaded_position(key: str, position: Position) -> None:
     """Reject corrupted state instead of letting NaN/negative cash bypass risk."""
     if (not _safe_identifier(key) or str(position.token_id) != key
@@ -1349,6 +1392,9 @@ def _validate_loaded_position(key: str, position: Position) -> None:
             or abs(position.fees - fees) > tolerance
             or abs(position.cost - cost) > tolerance):
         raise ValueError("position aggregates do not match lots")
+    if abs(position.realized_from_sales
+           - _replay_realized_from_sales(position)) > tolerance:
+        raise ValueError("realized_from_sales does not match the recorded SELL lots")
     for value in (position.realized_from_sales, position.sell_fees):
         if not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError("invalid position sales amount")

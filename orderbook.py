@@ -2,7 +2,7 @@
 import math
 import os
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_UP, Decimal, InvalidOperation
 
 import requests
 
@@ -276,3 +276,50 @@ def validate_buy_liquidity(token_id, amount, max_price, max_spread, min_price=0.
         raise ValueError(
             f"FOK preflight: only ${available:.6f} available at or below {max_price}")
     return bids, asks
+
+
+def venue_minimum_stake(wanted: Decimal, asks, minimum: Decimal, cap: Decimal) -> Decimal:
+    """Raise a dollar stake just enough to buy the venue's minimum shares.
+
+    Best-ask * minimum under-sizes whenever the top of book alone cannot
+    fill the venue's minimum share count - a thin top level makes a $2.50
+    FOK walk into 0.51 and land at 4.96 shares. This walks the same
+    executable asks the fill will actually consume. Shared by paper_trade.py
+    (paper FOK sizing) and polymarket_trade.py (live order sizing) so a
+    correction to this walk only ever needs to land once, instead of the two
+    hand-written copies this replaced silently drifting apart.
+
+    `asks` is an iterable of (price, size) Decimal pairs, best (lowest ask)
+    first. A level whose price or size is not strictly positive is skipped
+    rather than treated as the end of the book, unless its price exceeds
+    `cap` - past that nothing on the book is buyable at all, so the walk
+    stops there exactly as the caller's own FOK/FAK order would. Returns
+    `wanted` unchanged whenever it cannot verify a raise is needed (no
+    minimum, no asks, an invalid cap, or the ladder cannot fill the minimum
+    even at the cap), so an unreadable market can never silently enlarge an
+    order.
+    """
+    if minimum <= 0 or cap <= 0:
+        return wanted
+    asks = list(asks)
+    if not asks:
+        return wanted
+    best_price, _best_size = asks[0]
+    if best_price <= 0 or best_price > cap:
+        return wanted
+    remaining = minimum
+    notional = Decimal("0")
+    for price, size in asks:
+        if price > cap:
+            break
+        if price <= 0 or size <= 0:
+            continue
+        take = remaining if remaining <= size else size
+        notional += take * price
+        remaining -= take
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        return wanted
+    required = notional.quantize(Decimal("0.01"), rounding=ROUND_UP)
+    return wanted if wanted >= required else required

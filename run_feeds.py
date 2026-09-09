@@ -563,32 +563,46 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     # A dead/stale RTDS feed withholds the Chainlink decision leg; it never
     # substitutes the ordinary Chainlink spot aggregator.
     import config
-    # Name a hijacked resolver once, here, rather than leaving it to be
-    # inferred from a stream of SSLError/ConnectTimeout that reads like a
-    # venue outage. Diagnostic only - it changes no resolution or routing.
-    try:
-        import http_pool as _hp
-        _dns_status, _dns_detail = _hp.dns_redirect_report()
-        if _dns_status == "redirected":
-            on_event("dns", f"Polymarket DNS is redirected: {_dns_detail}", "bad")
-            # on_event alone only reaches the dashboard event ring. LIVE is
-            # fail-closed on the startup balance read, so a redirected
-            # resolver kills the process before that ring is ever displayed
-            # and the operator sees only "Could not read balance/allowance",
-            # which reads like a credential or venue fault. Name the real
-            # cause on the console, where it survives an immediate exit.
-            # Safe either way: before probe.install() this reaches the real
-            # console, after it the sink turns it into an event row rather
-            # than painting over the dashboard.
-            print("[DNS] Polymarket name resolution is redirected.",
-                  file=sys.stderr)
-            print(f"      {_dns_detail}", file=sys.stderr)
-            print("      Venue calls will fail TLS. LIVE cannot read its "
-                  "balance and will refuse to start.", file=sys.stderr)
-        elif _dns_status == "unknown":
-            on_event("dns", f"DNS check inconclusive: {_dns_detail}", "warn")
-    except Exception as _dns_exc:
-        on_event("dns", f"DNS check failed: {type(_dns_exc).__name__}", "warn")
+
+    # Both of these are blocking network I/O (DNS + a probe HTTP call; up to
+    # 63s of retried HTTP for the CLOB client) that used to run synchronously
+    # on the event loop, one after the other. Launched as background tasks
+    # here instead, they run concurrently with each other AND with the rest
+    # of this function's (non-blocking) setup below, and are only waited on
+    # once - alongside http_pool.warm() - right before the strategy loop
+    # starts. Each already reports its own outcome via on_event/print and is
+    # best-effort by contract, so a failure here must never propagate and
+    # stop startup; that is enforced by keeping every failure path inside the
+    # task itself rather than at the await site.
+    async def _dns_check_task() -> None:
+        # Name a hijacked resolver once, here, rather than leaving it to be
+        # inferred from a stream of SSLError/ConnectTimeout that reads like a
+        # venue outage. Diagnostic only - it changes no resolution or routing.
+        try:
+            import http_pool as _hp
+            _dns_status, _dns_detail = await asyncio.to_thread(_hp.dns_redirect_report)
+            if _dns_status == "redirected":
+                on_event("dns", f"Polymarket DNS is redirected: {_dns_detail}", "bad")
+                # on_event alone only reaches the dashboard event ring. LIVE is
+                # fail-closed on the startup balance read, so a redirected
+                # resolver kills the process before that ring is ever displayed
+                # and the operator sees only "Could not read balance/allowance",
+                # which reads like a credential or venue fault. Name the real
+                # cause on the console, where it survives an immediate exit.
+                # Safe either way: before probe.install() this reaches the real
+                # console, after it the sink turns it into an event row rather
+                # than painting over the dashboard.
+                print("[DNS] Polymarket name resolution is redirected.",
+                      file=sys.stderr)
+                print(f"      {_dns_detail}", file=sys.stderr)
+                print("      Venue calls will fail TLS. LIVE cannot read its "
+                      "balance and will refuse to start.", file=sys.stderr)
+            elif _dns_status == "unknown":
+                on_event("dns", f"DNS check inconclusive: {_dns_detail}", "warn")
+        except Exception as _dns_exc:
+            on_event("dns", f"DNS check failed: {type(_dns_exc).__name__}", "warn")
+
+    dns_task = asyncio.create_task(_dns_check_task())
 
     strike = ChainlinkStrike(on_event=on_event, stale_after=config.TWAP_STALE_AFTER)
     import main_bot as _mb
@@ -598,26 +612,32 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     main_bot.stop_event.clear()
     main_bot.session_trades.clear()
     main_bot.execution_mode = "LIVE"
-    # Derive L2 credentials here, before the trading loop starts, instead of
-    # lazily inside the first order. _install_api_creds retries 3 times at a
-    # 20s HTTP timeout with 1s+2s blocking backoff - up to 63s - and the
-    # order path checks the round clock BEFORE that call and never again
-    # during it, so paying it mid-order stalls the loop through the window it
-    # was trying to trade. USER_WS startup happens to warm the same client,
-    # but it races the trading loop rather than preceding it.
-    #
-    # A failure here is not fatal: the order path still derives on demand
-    # exactly as before. This only moves the cost off the trade cycle.
-    try:
-        import polymarket_trade as _pt
-        _warm_t0 = time.monotonic()
-        _pt._get_client()
-        _warm_ms = (time.monotonic() - _warm_t0) * 1000.0
-        on_event("live", f"CLOB client ready in {_warm_ms:.0f}ms", "good")
-    except Exception as _warm_exc:
-        on_event("live",
-                 f"CLOB client not pre-warmed ({type(_warm_exc).__name__}); "
-                 f"the first order will derive credentials itself", "warn")
+
+    async def _clob_warm_task() -> None:
+        # Derive L2 credentials here, before the trading loop starts, instead
+        # of lazily inside the first order. _install_api_creds retries 3
+        # times at a 20s HTTP timeout with 1s+2s blocking backoff - up to
+        # 63s - and the order path checks the round clock BEFORE that call
+        # and never again during it, so paying it mid-order stalls the loop
+        # through the window it was trying to trade. USER_WS startup happens
+        # to warm the same client, but it races the trading loop rather than
+        # preceding it.
+        #
+        # A failure here is not fatal: the order path still derives on
+        # demand exactly as before. This only moves the cost off the trade
+        # cycle.
+        try:
+            import polymarket_trade as _pt
+            _warm_t0 = time.monotonic()
+            await asyncio.to_thread(_pt._get_client)
+            _warm_ms = (time.monotonic() - _warm_t0) * 1000.0
+            on_event("live", f"CLOB client ready in {_warm_ms:.0f}ms", "good")
+        except Exception as _warm_exc:
+            on_event("live",
+                     f"CLOB client not pre-warmed ({type(_warm_exc).__name__}); "
+                     f"the first order will derive credentials itself", "warn")
+
+    clob_warm_task = asyncio.create_task(_clob_warm_task())
     main_bot._paper_broker = None
     main_bot._accounting_enabled = True
     main_bot._round_exposure_provider = None
@@ -809,8 +829,13 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     warm_hosts = (f"{config.CLOB_HOST.rstrip('/')}/time",
                   market_discovery.GAMMA,
                   main_bot.BINANCE_AGG_TRADES)
-    warmed = await asyncio.gather(
-        *(asyncio.to_thread(http_pool.warm, *warm_hosts) for _ in range(2)))
+    # Gathered together with the DNS check and CLOB client warm-up launched
+    # earlier in this function: all three are independent startup I/O, so
+    # waiting on them together bounds total startup latency to roughly the
+    # slowest single leg instead of their sum.
+    warmed, *_ = await asyncio.gather(
+        asyncio.gather(*(asyncio.to_thread(http_pool.warm, *warm_hosts) for _ in range(2))),
+        dns_task, clob_warm_task)
     on_event("bot", f"venue connections pre-warmed ({min(warmed)}/{len(warm_hosts)} "
                     f"hosts on {len(warmed)} workers)",
              "good" if min(warmed) == len(warm_hosts) else "warn")
@@ -962,11 +987,23 @@ class _LiveExitBroker:
         import polymarket_trade
         self._pt = polymarket_trade
         self.last_error = None
+        # Set when a submission that crossed the exit cutoff still came back
+        # SUBMITTED. PAPER checks the same cutoff again after its modeled
+        # latency and ABORTS the fill if it has passed; LIVE deliberately
+        # cannot do that symmetric check before submitting - the real network
+        # round trip is the "latency" here, and by the time sell_shares()
+        # returns, the FAK has already resolved at the venue. There is
+        # nothing left to undo, but the caller should still know the fill's
+        # timing relative to the cutoff is unverified, rather than the two
+        # modes silently disagreeing about a case neither can otherwise see.
+        self.last_late = False
 
     def sell_shares(self, token_id, shares, *, min_price=0.0,
                     condition_id=None, window_end=None,
                     exit_cutoff_seconds=0.0) -> float:
         import timer as _timer
+        self.last_late = False
+        cutoff = None
         if window_end is not None:
             cutoff = float(window_end) - float(exit_cutoff_seconds)
             if _timer.unix() >= cutoff:
@@ -976,6 +1013,8 @@ class _LiveExitBroker:
             str(token_id), float(shares), min_price=float(min_price),
             condition_id=condition_id, window_end=window_end)
         self.last_error = self._pt.last_order_error
+        if submitted and cutoff is not None and _timer.unix() >= cutoff:
+            self.last_late = True
         return float(submitted or 0.0)
 
 
@@ -991,12 +1030,20 @@ async def _stop_loss_loop(hub, broker, ledger, stop, on_event) -> None:
     import config
     import timer
     fired: set[tuple[int, str]] = set()
-    # A LIVE exit only submits; its fill lands later on the private stream.
-    # Without a grace window the next poll still sees the full position and
-    # fires again, selling the same shares twice. PAPER books synchronously and
-    # is already flat by then, so the guard simply never triggers there.
-    inflight: dict[tuple[int, str], float] = {}
-    LIVE_FILL_GRACE_S = 10.0
+    # A LIVE exit only submits; its fill lands later on the private stream, so
+    # the ledger's `shares` can stay stale for longer than any fixed grace
+    # window (the FAK order itself resolves synchronously at the venue - only
+    # our local bookkeeping of it can lag). Re-deriving "how much is left to
+    # sell" from a possibly-stale ledger figure risks re-selling shares that
+    # were already sold. Instead, track shares SUBMITTED but not yet reflected
+    # in the ledger (`pending`), and only ever offer the ledger's current
+    # shares minus that pending amount - so a resubmission targets just the
+    # un-attempted remainder, never shares an earlier attempt already covers.
+    # As the ledger catches up (PAPER: within the same poll; LIVE: whenever
+    # the private stream delivers the fill), the observed drop in `shares`
+    # retires the matching amount of `pending`.
+    pending: dict[tuple[int, str], float] = {}
+    last_seen_shares: dict[tuple[int, str], float] = {}
     while not stop.is_set():
         try:
             sampled = timer.unix()
@@ -1006,18 +1053,28 @@ async def _stop_loss_loop(hub, broker, ledger, stop, on_event) -> None:
                      <= config.STOP_LOSS_ARM_SECONDS)
             condition = hub.condition_id
             if armed and condition:
+                # Not filtered to shares > 1e-9 here: a token that just went
+                # flat still needs its pending/last-seen bookkeeping updated
+                # to zero, or a later re-entry on the same token this round
+                # would be misread as the tail of the earlier exit.
                 held = []
                 with ledger._lock:
                     for token, pos in ledger.positions.items():
-                        if (not pos.settled and pos.shares > 1e-9
-                                and pos.condition_id == condition):
+                        if not pos.settled and pos.condition_id == condition:
                             held.append((token, pos.shares))
-                now_mono = time.monotonic()
                 for token, shares in held:
                     key = (window, token)
                     if key in fired:
                         continue
-                    if now_mono < inflight.get(key, 0.0):
+                    prev_seen = last_seen_shares.get(key)
+                    if prev_seen is not None:
+                        confirmed_drop = max(0.0, prev_seen - shares)
+                        if confirmed_drop > 0:
+                            pending[key] = max(
+                                0.0, pending.get(key, 0.0) - confirmed_drop)
+                    last_seen_shares[key] = shares
+                    remaining = shares - pending.get(key, 0.0)
+                    if remaining <= 1e-9:
                         continue
                     view = hub.book.view(str(token))
                     bid = getattr(view, "best_bid", None) if view else None
@@ -1025,17 +1082,24 @@ async def _stop_loss_loop(hub, broker, ledger, stop, on_event) -> None:
                         continue
                     on_event("stoploss",
                              f"bid {float(bid):.3f} <= {config.STOP_LOSS_PRICE:.3f} "
-                             f"with {remain:.0f}s left; exiting {shares:.4f} sh",
+                             f"with {remain:.0f}s left; exiting {remaining:.4f} sh",
                              "warn")
                     sold = await asyncio.to_thread(
-                        broker.sell_shares, str(token), float(shares),
+                        broker.sell_shares, str(token), float(remaining),
                         min_price=config.STOP_LOSS_FLOOR_PRICE,
                         condition_id=condition,
                         window_end=window + 300,
                         exit_cutoff_seconds=config.STOP_LOSS_EXIT_CUTOFF_SECONDS)
                     if sold > 0:
-                        inflight[key] = time.monotonic() + LIVE_FILL_GRACE_S
+                        pending[key] = pending.get(key, 0.0) + sold
                         on_event("stoploss", f"exited {sold:.4f} sh", "good")
+                        if getattr(broker, "last_late", False):
+                            on_event(
+                                "stoploss",
+                                "exit was submitted but the network round "
+                                "trip crossed the cutoff before returning; "
+                                "fill timing versus expiry is unverified",
+                                "warn")
                         # Only stop watching once the leg is actually flat. A
                         # partial fill leaves real exposure, and marking it
                         # done here would abandon the remainder.
@@ -1048,7 +1112,9 @@ async def _stop_loss_loop(hub, broker, ledger, stop, on_event) -> None:
                                  f"exit did not fill: {broker.last_error}", "warn")
             elif not armed:
                 fired = {k for k in fired if k[0] == window}
-                inflight = {k: v for k, v in inflight.items() if k[0] == window}
+                pending = {k: v for k, v in pending.items() if k[0] == window}
+                last_seen_shares = {k: v for k, v in last_seen_shares.items()
+                                    if k[0] == window}
         except Exception as exc:
             on_event("stoploss", f"{type(exc).__name__}: {exc}", "warn")
         await asyncio.sleep(config.STOP_LOSS_POLL_SECONDS)

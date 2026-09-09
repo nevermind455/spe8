@@ -107,16 +107,32 @@ def _split_timeout(timeout):
 
     A scalar reaching ``requests`` is applied to both phases, so the caller's
     number silently doubles.  Callers passing an explicit pair are left alone.
+
+    A caller's own scalar always wins: when it fits inside the configured
+    connect floor both phases just get that number, unchanged from before.
+    Above the floor, the budget is split into connect/read halves - never
+    giving connect less than the floor, since callers such as orderbook.py
+    (timeout=8.0) and market_discovery.py (timeout=10) are deliberately
+    asking for more than it to tolerate a slow handshake (this module's own
+    `warm()` has measured 2.3s-15.8s against the CLOB). Capping connect at
+    the bare floor regardless of what the caller asked for reintroduces
+    spurious ConnectTimeouts during exactly the cold-start conditions this
+    function exists to tolerate.
     """
     if timeout is None:
         return (config.HTTP_CONNECT_TIMEOUT_SECONDS, None)
     if isinstance(timeout, (tuple, list)):
         return tuple(timeout)
     try:
-        read = float(timeout)
+        total = float(timeout)
     except (TypeError, ValueError):
         return timeout
-    return (min(config.HTTP_CONNECT_TIMEOUT_SECONDS, read), read)
+    floor = config.HTTP_CONNECT_TIMEOUT_SECONDS
+    if total <= floor:
+        return (total, total)
+    connect = max(floor, total / 2.0)
+    read = max(total - connect, floor / 2.0)
+    return (connect, read)
 
 
 def session() -> requests.Session:

@@ -462,39 +462,19 @@ def _build_receipt(resp: dict, oid: str, status: str | None, *, condition_id,
 def _size_to_venue_minimum(amount, asks, rules, cap) -> float:
     """Raise a dollar stake just enough to buy the venue's minimum shares.
 
-    Mirrors paper_trade.size_to_venue_minimum, including a walk of the
-    executable asks. Best-ask * minimum under-sizes when the top of book
-    cannot fill 5 shares by itself. Returns the stake unchanged whenever
-    it cannot verify a raise is needed, so an unreadable market can never
-    silently enlarge a live order.
+    The ask-ladder walk itself lives in orderbook.venue_minimum_stake,
+    shared with paper_trade.size_to_venue_minimum's paper sizing, so a
+    correction only ever needs to land once. Returns the stake unchanged
+    whenever it cannot verify a raise is needed, so an unreadable market can
+    never silently enlarge a live order.
     """
     try:
         wanted = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         minimum = Decimal(str(rules["minimum"]))
-        if minimum <= 0 or not asks:
-            return float(wanted)
         ceiling = Decimal(str(cap))
-        best = Decimal(str(asks[0]["price"]))
-        if best <= 0 or best > ceiling:
-            return float(wanted)
-        remaining = minimum
-        notional = Decimal("0")
-        for level in asks:
-            price = Decimal(str(level["price"]))
-            available = Decimal(str(level["size"]))
-            if price <= 0 or price > ceiling or available <= 0:
-                if price > ceiling:
-                    break
-                continue
-            take = remaining if remaining <= available else available
-            notional += take * price
-            remaining -= take
-            if remaining <= 0:
-                break
-        if remaining > 0:
-            return float(wanted)
-        required = notional.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-        return float(wanted if wanted >= required else required)
+        normalized = [(Decimal(str(level["price"])), Decimal(str(level["size"])))
+                     for level in asks]
+        return float(orderbook.venue_minimum_stake(wanted, normalized, minimum, ceiling))
     except (InvalidOperation, KeyError, TypeError, ValueError):
         return float(amount)
 
@@ -683,6 +663,13 @@ def _journal_receipt(receipt: dict) -> bool:
         return False
 
 
+class GuardRejection:
+    """An explicit, non-authorizing rejection with a caller-supplied safe reason."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+
 def _pre_submit_guard_error(pre_submit_guard) -> str | None:
     """Run an optional last-moment execution guard and fail closed.
 
@@ -699,6 +686,8 @@ def _pre_submit_guard_error(pre_submit_guard) -> str | None:
         allowed = pre_submit_guard()
     except Exception as exc:
         return f"pre-submit guard failed closed: {type(exc).__name__}: {_safe_error(exc)}"
+    if isinstance(allowed, GuardRejection):
+        return f"pre-submit guard rejected order: {allowed.reason}"
     if allowed is not True:
         return "pre-submit guard rejected order"
     return None
