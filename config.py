@@ -477,6 +477,26 @@ def pair_lock_permits(entry_price, entry_fee_per_share,
 # runtime check in main_bot.py, not just this default - a signal that has
 # already lost ~$589 once on old code gets a second, cheaper way to be wrong.
 TAPER_HEDGE_ENABLED = bool(_env_bool("TAPER_HEDGE_ENABLED", False))
+# How many signal-side buys per opposite-side buy. The cycle runs this many
+# primary slots then one complement slot, so 2 is the original 2:1 shape and
+# 6 gives 6:1. Slot 1 takes TAPER_ENTRY1_USD, the remaining primary slots take
+# TAPER_ENTRY2_USD, and the last takes TAPER_HEDGE_INCREMENT_USD.
+#
+# Measured over 1032 settled fills on 2026-09-10, re-weighting the two legs by
+# their own per-fill returns:
+#
+#     1/1  -5.04%    2/1  -2.25%    3/1  -1.03%    6/1  +0.42%   no hedge +2.14%
+#
+# Read that with the caveat it deserves: on that sample NEITHER leg's edge was
+# statistically significant (primary +0.027, p=0.096; hedge -0.050, p=0.115),
+# and the run before it produced the OPPOSITE ranking with both legs
+# significant. Detecting a 3-point edge needs roughly 1,100 fills per leg. So
+# this knob moves a number that is, so far, inside the noise band - it exists
+# to make the ratio testable, not because a best value is known.
+TAPER_PRIMARY_SLOTS = int(_env_float("TAPER_PRIMARY_SLOTS", "2"))
+if TAPER_PRIMARY_SLOTS < 1:
+    raise ValueError("TAPER_PRIMARY_SLOTS must be at least 1")
+
 TAPER_ENTRY1_USD = _env_float("TAPER_ENTRY1_USD", "3.0")
 TAPER_ENTRY2_USD = _env_float("TAPER_ENTRY2_USD", "2.0")
 TAPER_HEDGE_INCREMENT_USD = _env_float("TAPER_HEDGE_INCREMENT_USD", "1.0")

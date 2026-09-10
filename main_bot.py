@@ -1258,9 +1258,10 @@ async def run_bot():
                     if limit and taper_skips >= limit:
                         taper_count += 1
                         taper_skips = 0
+                        span = max(1, config.TAPER_PRIMARY_SLOTS) + 1
                         print(f"{_ts()} [TAPER] slot unfilled after {limit} "
                               f"attempts; advancing to slot "
-                              f"{taper_count % 3 + 1}/3.")
+                              f"{taper_count % span + 1}/{span}.")
                 taper_slot_pending = True
 
                 # Follow the signal. A cycle is a bet on one side; once the
@@ -1286,11 +1287,16 @@ async def run_bot():
                           f"{taper_count % 3 + 1}/3; re-anchoring, cadence kept.")
                     taper_primary_side = side
                 taper_anchor_side = taper_primary_side or side
-                cycle_pos = taper_count % 3
+                # TAPER_PRIMARY_SLOTS signal-side buys, then one on the
+                # complement. Slot 1 is the entry-1 size, every later primary
+                # slot repeats the entry-2 size, and the last slot is the
+                # hedge - so 2 is the original 2:1 shape and 6 gives 6:1.
+                primary_slots = max(1, config.TAPER_PRIMARY_SLOTS)
+                cycle_pos = taper_count % (primary_slots + 1)
                 if cycle_pos == 0:
                     entry_amount = config.TAPER_ENTRY1_USD
                     entry_side = taper_anchor_side
-                elif cycle_pos == 1:
+                elif cycle_pos < primary_slots:
                     entry_amount = config.TAPER_ENTRY2_USD
                     entry_side = taper_anchor_side
                 else:

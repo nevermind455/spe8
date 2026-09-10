@@ -1126,7 +1126,7 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   liquidity_probe=None, primary_band=None,
                                   decision_rule=None, unsettled_provider=None,
                                   max_unsettled=0.0, require_unanimity=False,
-                                  taper_advance=0):
+                                  taper_advance=0, primary_slots=None):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1246,6 +1246,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "MAX_UNSETTLED_EXPOSURE", max_unsettled)
         replace(main_bot.config, "REQUIRE_SIGNAL_UNANIMITY", require_unanimity)
         replace(main_bot.config, "TAPER_ADVANCE_AFTER_SKIPS", taper_advance)
+        if primary_slots is not None:
+            replace(main_bot.config, "TAPER_PRIMARY_SLOTS", primary_slots)
         replace(main_bot, "_unsettled_exposure_provider", unsettled_provider)
         replace(main_bot.config, "TAPER_HEDGE_ENABLED", taper_hedge_enabled)
         if primary_band is not None:
@@ -2025,6 +2027,56 @@ async def t_taper_advances_past_a_slot_whose_side_has_priced_out():
     check("the default leaves the cycle waiting, as it always did",
           main_bot.config.TAPER_ADVANCE_AFTER_SKIPS == 0
           or taper_advance is not None)
+
+
+async def t_taper_primary_slots_sets_the_signal_to_opposite_ratio():
+    """TAPER_PRIMARY_SLOTS controls how many signal-side buys per opposite.
+
+    The cycle was hardcoded to two primary slots and one complement. This
+    makes the ratio configurable so it can be TESTED - not because a best
+    value is known. On the 1032-fill sample that motivated it, neither leg's
+    edge reached significance (primary +0.027 p=0.096, hedge -0.050 p=0.115)
+    and the previous run ranked the two legs the other way round with both
+    significant. Roughly 1,100 fills per leg are needed to call a 3-point
+    edge, so every ratio here currently sits inside the noise band.
+    """
+    async def cycle(slots, orders):
+        return await _drive_phase2_with_hold(
+            execution_mode="PAPER", held_provider=lambda *_a: set(),
+            price_votes=("UP",) * 80, stop_after_orders=orders,
+            taper_hedge_enabled=True, primary_slots=slots, timeout=5.0)
+
+    two = await cycle(2, 6)
+    check("the default 2 keeps the original 2:1 shape",
+          two["order_sides"] == ["UP", "UP", "DOWN", "UP", "UP", "DOWN"],
+          str(two["order_sides"]))
+    check("with the original 3 / 2 / hedge sizing",
+          [round(a, 2) for a in two["order_amounts"]] == [3.0, 2.0, 1.0] * 2,
+          str(two["order_amounts"]))
+
+    six = await cycle(6, 7)
+    check("6 gives six signal-side buys then one opposite",
+          six["order_sides"] == ["UP"] * 6 + ["DOWN"], str(six["order_sides"]))
+    check("entry-1 size once, entry-2 size for the rest, then the hedge",
+          [round(a, 2) for a in six["order_amounts"]]
+          == [3.0] + [2.0] * 5 + [1.0], str(six["order_amounts"]))
+
+    one = await cycle(1, 4)
+    check("1 alternates signal and opposite",
+          one["order_sides"] == ["UP", "DOWN", "UP", "DOWN"],
+          str(one["order_sides"]))
+    check("and skips the entry-2 size entirely, having no middle slot",
+          [round(a, 2) for a in one["order_amounts"]] == [3.0, 1.0] * 2,
+          str(one["order_amounts"]))
+
+
+def t_taper_primary_slots_is_validated():
+    """A cycle needs at least one signal-side slot to anchor the hedge to."""
+    bad = _reload_config(TAPER_PRIMARY_SLOTS="0")
+    check("zero primary slots is refused",
+          "TAPER_PRIMARY_SLOTS" in (bad or ""), str(bad))
+    ok = _reload_config(TAPER_PRIMARY_SLOTS="6")
+    check("a larger ratio is accepted", ok is None, str(ok))
 
 
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():
