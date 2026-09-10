@@ -609,7 +609,8 @@ def _kill_switch():
 async def run_bot():
     start_price = None
     joined_window = None
-    boundary_backfilled = False
+    backfill_tries = 0
+    last_backfill = 0.0
     start_chainlink_price = None
     active_window = None
     round_exposure = 0.0
@@ -718,7 +719,8 @@ async def run_bot():
             # old loop only overwrote these when a feed read succeeded.
             active_window = round_window
             start_price = None
-            boundary_backfilled = False
+            backfill_tries = 0
+            last_backfill = 0.0
             start_chainlink_price = None
             # The on-screen trade log is a per-round view. Rows from the round
             # that just closed would read as activity in this market, so the
@@ -794,19 +796,40 @@ async def run_bot():
                         f"(Binance start_price=${start_price:,.2f})"
                     )
                     break
-            if (start_price is None and not boundary_backfilled
+            if (start_price is None
+                    and backfill_tries < config.BOUNDARY_BACKFILL_RETRIES
                     and exact_remaining <= 300 - config.BOUNDARY_BACKFILL_AFTER):
                 # The socket has had its chance; ask REST for the same trade.
-                boundary_backfilled = True
-                recovered = await asyncio.to_thread(
-                    _recover_boundary_print, active_window)
-                if recovered is not None:
-                    start_price = recovered
-                    print(f"{_ts()} [ROUND] Opening print recovered from REST "
-                          f"(Binance start_price=${start_price:,.2f})")
-                else:
-                    print(f"{_ts()} [ROUND] Opening print could not be recovered; "
-                          f"this round has no Binance reference.")
+                #
+                # Retried rather than attempted once. The flag this replaced
+                # was set BEFORE the call, so a single timeout or 429 left the
+                # round with no opening print - and without one price_signal
+                # is None, every attempt is refused, and the round silently
+                # produces nothing. _recover_boundary_print asks for the same
+                # [window, window+5) interval each time and refuses anything
+                # stamped outside it, so a later attempt still returns the
+                # opening print, never a mid-round substitute.
+                loop_now = asyncio.get_running_loop().time()
+                if (backfill_tries == 0
+                        or loop_now - last_backfill
+                        >= config.BOUNDARY_BACKFILL_RETRY_GAP):
+                    backfill_tries += 1
+                    last_backfill = loop_now
+                    recovered = await asyncio.to_thread(
+                        _recover_boundary_print, active_window)
+                    if recovered is not None:
+                        start_price = recovered
+                        print(f"{_ts()} [ROUND] Opening print recovered from REST "
+                              f"(Binance start_price=${start_price:,.2f}) "
+                              f"on attempt {backfill_tries}")
+                    elif backfill_tries >= config.BOUNDARY_BACKFILL_RETRIES:
+                        print(f"{_ts()} [ROUND] Opening print could not be "
+                              f"recovered after {backfill_tries} attempts; "
+                              f"this round has no Binance reference.")
+                    else:
+                        print(f"{_ts()} [ROUND] Opening print recovery attempt "
+                              f"{backfill_tries} failed; retrying in "
+                              f"{config.BOUNDARY_BACKFILL_RETRY_GAP:.0f}s.")
 
         now = asyncio.get_running_loop().time()
         if now - last_status >= 30:

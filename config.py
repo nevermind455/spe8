@@ -334,6 +334,25 @@ if (not math.isfinite(ASSUMED_MATCH_DELAY_SECONDS)
 # substituting a later price. Give the socket a real chance first; retrying too
 # early just spends an API call on a print that was about to arrive.
 BOUNDARY_BACKFILL_AFTER = _env_float("BOUNDARY_BACKFILL_AFTER", "15")
+# How many times the REST recovery may be tried, and how long to wait
+# between attempts. It used to run exactly ONCE per round: the "already
+# tried" flag was set BEFORE the call, so a single timeout or 429 cost the
+# whole round - no opening print means price_signal returns None, every
+# attempt is refused, and the round produces nothing at all. Measured over 89
+# rounds the bot was actually up for, 10% produced no trade whatsoever.
+#
+# Retrying is safe because _recover_boundary_print queries the SAME
+# [window, window+5) interval every time and refuses a response stamped
+# outside it. A later attempt therefore returns the same opening print the
+# socket would have latched, never a mid-round price standing in for it -
+# which is the substitution the strike logic exists to prevent.
+BOUNDARY_BACKFILL_RETRIES = int(_env_float("BOUNDARY_BACKFILL_RETRIES", "3"))
+if not 1 <= BOUNDARY_BACKFILL_RETRIES <= 20:
+    raise ValueError("BOUNDARY_BACKFILL_RETRIES must be between 1 and 20")
+BOUNDARY_BACKFILL_RETRY_GAP = _env_float("BOUNDARY_BACKFILL_RETRY_GAP", "10")
+if (not math.isfinite(BOUNDARY_BACKFILL_RETRY_GAP)
+        or not 1 <= BOUNDARY_BACKFILL_RETRY_GAP <= 120):
+    raise ValueError("BOUNDARY_BACKFILL_RETRY_GAP must be between 1 and 120 seconds")
 if not math.isfinite(BOUNDARY_BACKFILL_AFTER) or not 5 <= BOUNDARY_BACKFILL_AFTER <= 120:
     raise ValueError("BOUNDARY_BACKFILL_AFTER must be between 5 and 120 seconds")
 

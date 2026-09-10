@@ -2144,6 +2144,87 @@ def t_taper_ladder_is_parsed_and_validated():
           "TAPER_HEDGE_LADDER" in (orphan or ""), str(orphan))
 
 
+def t_boundary_backfill_retries_without_ever_substituting_a_later_print():
+    """A transient REST failure must not cost the whole round.
+
+    Without an opening print price_signal returns None, every attempt is
+    refused, and the round produces nothing at all - silently, since the
+    refusal happens before any journal row is written. The recovery used to
+    run exactly ONCE: the "already tried" flag was set BEFORE the call, so a
+    single timeout or 429 was terminal. Measured over 89 rounds the bot was
+    actually up for, 10% produced no trade whatsoever.
+
+    Retrying is only safe because the query is pinned to the round's opening
+    5 seconds. This checks BOTH halves: that a later attempt still succeeds,
+    and that a response stamped outside the window is refused however many
+    attempts have been made - a mid-round price standing in for the open
+    inverts the signal once price has moved.
+    """
+    import types
+    import main_bot
+
+    class Resp:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._rows
+
+    saved = main_bot.http_pool
+    window = 1_786_320_000
+    try:
+        # A print from later in the round is refused, not latched.
+        def late(_url, params=None, timeout=None):
+            w = params["startTime"] // 1000
+            return Resp([{"T": (w + 200) * 1000, "p": "70000.0"}])
+        main_bot.http_pool = types.SimpleNamespace(get=late)
+        check("a print stamped after the opening window is refused",
+              main_bot._recover_boundary_print(window) is None)
+
+        # The query itself must be pinned to [window, window+5).
+        seen = {}
+        def capture(_url, params=None, timeout=None):
+            seen.update(params)
+            w = params["startTime"] // 1000
+            return Resp([{"T": (w + 2) * 1000, "p": "69000.0"}])
+        main_bot.http_pool = types.SimpleNamespace(get=capture)
+        got = main_bot._recover_boundary_print(window)
+        check("an in-window print is accepted", got == 69000.0, str(got))
+        check("and the request asks for exactly the opening 5 seconds",
+              seen.get("startTime") == window * 1000
+              and seen.get("endTime") == (window + 5) * 1000, str(seen))
+
+        # A transient failure returns None rather than raising, so the caller
+        # is free to try again on a later pass.
+        def blip(_url, params=None, timeout=None):
+            raise TimeoutError("simulated network blip")
+        main_bot.http_pool = types.SimpleNamespace(get=blip)
+        check("a transient failure is reported as None, not raised",
+              main_bot._recover_boundary_print(window) is None)
+    finally:
+        main_bot.http_pool = saved
+
+
+def t_boundary_backfill_retry_settings_are_validated():
+    """Retry count and spacing are bounded, and default to retrying."""
+    import main_bot
+    check("the default retries rather than trying once",
+          main_bot.config.BOUNDARY_BACKFILL_RETRIES > 1,
+          str(main_bot.config.BOUNDARY_BACKFILL_RETRIES))
+    check("zero retries is refused",
+          bool(_reload_config(BOUNDARY_BACKFILL_RETRIES="0")))
+    check("an absurd retry count is refused",
+          bool(_reload_config(BOUNDARY_BACKFILL_RETRIES="99")))
+    check("a zero retry gap is refused",
+          bool(_reload_config(BOUNDARY_BACKFILL_RETRY_GAP="0")))
+    check("a sane pair is accepted",
+          _reload_config(BOUNDARY_BACKFILL_RETRIES="3",
+                         BOUNDARY_BACKFILL_RETRY_GAP="10") is None)
+
+
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():
     """A hedge leg must not die because the PRIMARY side's book blipped.
 
