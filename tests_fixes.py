@@ -1126,7 +1126,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   liquidity_probe=None, primary_band=None,
                                   decision_rule=None, unsettled_provider=None,
                                   max_unsettled=0.0, require_unanimity=False,
-                                  taper_advance=0, primary_slots=None):
+                                  taper_advance=0, primary_slots=None,
+                                  primary_ladder=None, hedge_ladder=None):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1248,6 +1249,10 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "TAPER_ADVANCE_AFTER_SKIPS", taper_advance)
         if primary_slots is not None:
             replace(main_bot.config, "TAPER_PRIMARY_SLOTS", primary_slots)
+        if primary_ladder is not None:
+            replace(main_bot.config, "TAPER_PRIMARY_LADDER", primary_ladder)
+        if hedge_ladder is not None:
+            replace(main_bot.config, "TAPER_HEDGE_LADDER", hedge_ladder)
         replace(main_bot, "_unsettled_exposure_provider", unsettled_provider)
         replace(main_bot.config, "TAPER_HEDGE_ENABLED", taper_hedge_enabled)
         if primary_band is not None:
@@ -2077,6 +2082,66 @@ def t_taper_primary_slots_is_validated():
           "TAPER_PRIMARY_SLOTS" in (bad or ""), str(bad))
     ok = _reload_config(TAPER_PRIMARY_SLOTS="6")
     check("a larger ratio is accepted", ok is None, str(ok))
+
+
+async def t_taper_ladder_sizes_each_slot_and_sets_the_cycle_length():
+    """An explicit ladder gives every slot its own size.
+
+    The old scheme had exactly two primary sizes (entry-1 then entry-2
+    repeated) and a single complement slot, so a shape like 4/3/2 then 2 was
+    not expressible. The ladder's LENGTH now sets the slot count, and the
+    values set the sizes.
+
+    Note the venue's 5-share minimum compresses a ladder at high prices: an
+    order costs at least 5 x price, so near 0.80 every slot costs about the
+    same whatever it asks for. A ladder separates only where fills are cheap.
+    """
+    laddered = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 80, stop_after_orders=8,
+        taper_hedge_enabled=True, primary_ladder=(4.0, 3.0, 2.0),
+        hedge_ladder=(2.0,), timeout=5.0)
+    check("three signal-side slots then one opposite, twice over",
+          laddered["order_sides"] == ["UP", "UP", "UP", "DOWN"] * 2,
+          str(laddered["order_sides"]))
+    check("each slot takes its own laddered size",
+          [round(a, 2) for a in laddered["order_amounts"]]
+          == [4.0, 3.0, 2.0, 2.0] * 2, str(laddered["order_amounts"]))
+
+    # Several complement slots are expressible too, and the hedge ladder's
+    # length is what decides how many.
+    wide = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 80, stop_after_orders=5,
+        taper_hedge_enabled=True, primary_ladder=(3.0, 2.0),
+        hedge_ladder=(1.0, 1.0), timeout=5.0)
+    check("a two-slot hedge ladder gives two complement buys",
+          wide["order_sides"][:4] == ["UP", "UP", "DOWN", "DOWN"],
+          str(wide["order_sides"]))
+
+    # Unset, the previous behaviour has to be byte-for-byte intact.
+    legacy = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 80, stop_after_orders=6,
+        taper_hedge_enabled=True, primary_ladder=(), hedge_ladder=(),
+        timeout=5.0)
+    check("no ladder leaves the entry1/entry2/hedge scheme unchanged",
+          [round(a, 2) for a in legacy["order_amounts"]] == [3.0, 2.0, 1.0] * 2,
+          str(legacy["order_amounts"]))
+
+
+def t_taper_ladder_is_parsed_and_validated():
+    """A malformed ladder must fail at import, not size an order wrongly."""
+    ok = _reload_config(TAPER_PRIMARY_LADDER="4,3,2", TAPER_HEDGE_LADDER="2")
+    check("a well-formed ladder is accepted", ok is None, str(ok))
+    for bad, why in ((("4,x,2", ""), "non-numeric"),
+                     (("4,0,2", ""), "zero"),
+                     (("4,-3", ""), "negative")):
+        err = _reload_config(TAPER_PRIMARY_LADDER=bad[0])
+        check(f"a {why} amount is refused", bool(err), f"{bad[0]} -> {err}")
+    orphan = _reload_config(TAPER_HEDGE_LADDER="2")
+    check("a hedge ladder with no primary ladder is refused",
+          "TAPER_HEDGE_LADDER" in (orphan or ""), str(orphan))
 
 
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():

@@ -341,6 +341,18 @@ class _RoundSignalEpoch:
         return True, "verified transition of the deciding signal"
 
 
+def _taper_cycle_span() -> int:
+    """Slots in one taper cycle: signal-side slots plus complement slots.
+
+    An explicit ladder defines both counts by its length; without one the
+    cycle is TAPER_PRIMARY_SLOTS signal slots and a single complement slot.
+    """
+    if config.TAPER_PRIMARY_LADDER:
+        return (len(config.TAPER_PRIMARY_LADDER)
+                + len(config.TAPER_HEDGE_LADDER or (0,)))
+    return max(1, config.TAPER_PRIMARY_SLOTS) + 1
+
+
 def _signals_unanimous(price_side, book_side, chainlink_side) -> bool:
     """True when every signal that voted names the same side.
 
@@ -1258,7 +1270,7 @@ async def run_bot():
                     if limit and taper_skips >= limit:
                         taper_count += 1
                         taper_skips = 0
-                        span = max(1, config.TAPER_PRIMARY_SLOTS) + 1
+                        span = _taper_cycle_span()
                         print(f"{_ts()} [TAPER] slot unfilled after {limit} "
                               f"attempts; advancing to slot "
                               f"{taper_count % span + 1}/{span}.")
@@ -1284,23 +1296,32 @@ async def run_bot():
                 if taper_primary_side is not None and side != taper_primary_side:
                     print(f"{_ts()} [TAPER] Signal flipped "
                           f"{taper_primary_side} -> {side} at cycle slot "
-                          f"{taper_count % 3 + 1}/3; re-anchoring, cadence kept.")
+                          f"{taper_count % _taper_cycle_span() + 1}"
+                          f"/{_taper_cycle_span()}; re-anchoring, cadence kept.")
                     taper_primary_side = side
                 taper_anchor_side = taper_primary_side or side
-                # TAPER_PRIMARY_SLOTS signal-side buys, then one on the
-                # complement. Slot 1 is the entry-1 size, every later primary
-                # slot repeats the entry-2 size, and the last slot is the
-                # hedge - so 2 is the original 2:1 shape and 6 gives 6:1.
-                primary_slots = max(1, config.TAPER_PRIMARY_SLOTS)
-                cycle_pos = taper_count % (primary_slots + 1)
-                if cycle_pos == 0:
-                    entry_amount = config.TAPER_ENTRY1_USD
-                    entry_side = taper_anchor_side
-                elif cycle_pos < primary_slots:
-                    entry_amount = config.TAPER_ENTRY2_USD
+                # Signal-side slots, then complement slots. An explicit
+                # ladder gives each slot its own size and its LENGTH sets the
+                # slot count; without one, slot 1 takes the entry-1 size,
+                # later primary slots repeat the entry-2 size, and a single
+                # slot takes the hedge size.
+                ladder = config.TAPER_PRIMARY_LADDER
+                hedge_ladder = config.TAPER_HEDGE_LADDER or (
+                    config.TAPER_HEDGE_INCREMENT_USD,)
+                if ladder:
+                    primary_slots = len(ladder)
+                    hedge_slots = len(hedge_ladder)
+                else:
+                    primary_slots = max(1, config.TAPER_PRIMARY_SLOTS)
+                    hedge_slots = 1
+                cycle_pos = taper_count % (primary_slots + hedge_slots)
+                if cycle_pos < primary_slots:
+                    entry_amount = (ladder[cycle_pos] if ladder else
+                                    config.TAPER_ENTRY1_USD if cycle_pos == 0
+                                    else config.TAPER_ENTRY2_USD)
                     entry_side = taper_anchor_side
                 else:
-                    entry_amount = config.TAPER_HEDGE_INCREMENT_USD
+                    entry_amount = hedge_ladder[cycle_pos - primary_slots]
                     entry_side = "DOWN" if taper_anchor_side == "UP" else "UP"
                     is_taper_hedge = True
 

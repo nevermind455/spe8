@@ -501,6 +501,52 @@ TAPER_ENTRY1_USD = _env_float("TAPER_ENTRY1_USD", "3.0")
 TAPER_ENTRY2_USD = _env_float("TAPER_ENTRY2_USD", "2.0")
 TAPER_HEDGE_INCREMENT_USD = _env_float("TAPER_HEDGE_INCREMENT_USD", "1.0")
 
+
+def _taper_ladder(name: str) -> tuple[float, ...]:
+    """Per-slot dollar amounts, e.g. "4,3,2". Empty means "not configured"."""
+    raw = (_env_text(name, "") or "").strip()
+    if not raw:
+        return ()
+    out = []
+    for piece in raw.replace(";", ",").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            value = float(piece)
+        except ValueError:
+            raise ValueError(f"{name} entries must be numbers, got {piece!r}")
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} entries must be finite and positive")
+        out.append(value)
+    if not out:
+        raise ValueError(f"{name} was set but lists no amounts")
+    return tuple(out)
+
+
+# Explicit per-slot sizing, which supersedes TAPER_ENTRY1/2_USD,
+# TAPER_HEDGE_INCREMENT_USD and TAPER_PRIMARY_SLOTS when set.
+#
+#     TAPER_PRIMARY_LADDER=4,3,2      three signal-side slots at $4, $3, $2
+#     TAPER_HEDGE_LADDER=2            one opposite slot at $2
+#
+# The LENGTH of each list sets the number of slots, so the pair above is a
+# 3:1 cycle. Leave both empty and the old scheme applies unchanged: slot 1 at
+# TAPER_ENTRY1_USD, the remaining TAPER_PRIMARY_SLOTS-1 at TAPER_ENTRY2_USD,
+# then one slot at TAPER_HEDGE_INCREMENT_USD.
+#
+# The venue's 5-share minimum compresses a ladder at high prices: an order
+# always costs at least 5 x price, so at 0.80 every slot costs $4.00 whatever
+# it asks for, and at a 0.663 average the floor is $3.32. A 4/3/2 ladder is
+# therefore closer to 4/3.32/3.32 in practice - it separates only where fills
+# are cheap.
+TAPER_PRIMARY_LADDER = _taper_ladder("TAPER_PRIMARY_LADDER")
+TAPER_HEDGE_LADDER = _taper_ladder("TAPER_HEDGE_LADDER")
+if TAPER_HEDGE_LADDER and not TAPER_PRIMARY_LADDER:
+    raise ValueError(
+        "TAPER_HEDGE_LADDER needs TAPER_PRIMARY_LADDER; a cycle with no "
+        "signal-side slot has nothing for the opposite slot to hedge")
+
 # Advance the taper cycle after this many consecutive attempts that selected a
 # slot but could not fill it. 0 keeps the old behaviour: the cycle waits on
 # that slot indefinitely.
