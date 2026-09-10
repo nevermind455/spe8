@@ -480,6 +480,27 @@ TAPER_HEDGE_ENABLED = bool(_env_bool("TAPER_HEDGE_ENABLED", False))
 TAPER_ENTRY1_USD = _env_float("TAPER_ENTRY1_USD", "3.0")
 TAPER_ENTRY2_USD = _env_float("TAPER_ENTRY2_USD", "2.0")
 TAPER_HEDGE_INCREMENT_USD = _env_float("TAPER_HEDGE_INCREMENT_USD", "1.0")
+
+# Advance the taper cycle after this many consecutive attempts that selected a
+# slot but could not fill it. 0 keeps the old behaviour: the cycle waits on
+# that slot indefinitely.
+#
+# Why it is needed. Slots 1 and 2 both buy the anchored side, so when that
+# side prices outside MIN/MAX_BUY_PRICE the cycle cannot fill and cannot move
+# - and because it never reaches slot 3, it never tries the complement, which
+# in a binary market is precisely the leg that IS cheap when the anchor is
+# expensive. A stable signal plus a priced-out anchor therefore costs the rest
+# of the round. Measured on archived runs, 43% of phase-2 attempts already
+# ended skipped_unfillable on a WIDER band than the current 0.30-0.80.
+#
+# The trade: the 2 signal : 1 opposite cadence is exact over FILLS only while
+# nothing advances on a skip. Set this and the ratio becomes approximate -
+# slots can be stepped past without ever filling. That is the point (progress
+# beats precision when the book has moved away), but it is a real change to
+# what the cadence guarantees.
+TAPER_ADVANCE_AFTER_SKIPS = int(_env_float("TAPER_ADVANCE_AFTER_SKIPS", "0"))
+if TAPER_ADVANCE_AFTER_SKIPS < 0:
+    raise ValueError("TAPER_ADVANCE_AFTER_SKIPS must be zero or positive")
 for _taper_name, _taper_value in (
         ("TAPER_ENTRY1_USD", TAPER_ENTRY1_USD),
         ("TAPER_ENTRY2_USD", TAPER_ENTRY2_USD),

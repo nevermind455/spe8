@@ -1125,7 +1125,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   taper_hedge_enabled=False, token_books=None,
                                   liquidity_probe=None, primary_band=None,
                                   decision_rule=None, unsettled_provider=None,
-                                  max_unsettled=0.0, require_unanimity=False):
+                                  max_unsettled=0.0, require_unanimity=False,
+                                  taper_advance=0):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1244,6 +1245,7 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                 decision_rule or ("minority" if minority_rule else "price"))
         replace(main_bot.config, "MAX_UNSETTLED_EXPOSURE", max_unsettled)
         replace(main_bot.config, "REQUIRE_SIGNAL_UNANIMITY", require_unanimity)
+        replace(main_bot.config, "TAPER_ADVANCE_AFTER_SKIPS", taper_advance)
         replace(main_bot, "_unsettled_exposure_provider", unsettled_provider)
         replace(main_bot.config, "TAPER_HEDGE_ENABLED", taper_hedge_enabled)
         if primary_band is not None:
@@ -1961,6 +1963,68 @@ async def t_unanimity_filter_refuses_contested_reads_without_breaking_cadence():
           [round(a, 2) for a in agreed["order_amounts"]]
           == [3.0, 2.0, 1.0, 3.0, 2.0, 1.0],
           str(agreed["order_amounts"]))
+
+
+async def t_taper_advances_past_a_slot_whose_side_has_priced_out():
+    """A slot that cannot fill must not hold the cycle for the whole round.
+
+    Slots 1 and 2 both buy the anchored side, so once that side prices
+    outside MIN/MAX_BUY_PRICE they are BOTH unfillable - and because the
+    cycle only advances on a fill, it never reaches slot 3, the complement,
+    which in a binary market is the leg that is cheap exactly when the anchor
+    is expensive. A stable signal plus a priced-out anchor therefore costs
+    the rest of the round.
+
+    TAPER_ADVANCE_AFTER_SKIPS steps past such a slot. The trade is explicit:
+    the 2:1 cadence is exact over fills only while nothing advances on a
+    skip, so with this set the ratio becomes approximate.
+    """
+    def make_probe():
+        seen = {"up": 0}
+        def probe(token, *_a, **_k):
+            if str(token) == "11":      # up_token_id here; fills twice then
+                seen["up"] += 1         # prices out of the band for good
+                if seen["up"] > 2:
+                    raise ValueError("best ask 0.95 is above MAX_BUY_PRICE 0.80")
+            return (), ()
+        return probe
+
+    stuck = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 80, stop_after_orders=4,
+        taper_hedge_enabled=True, liquidity_probe=make_probe(),
+        taper_advance=0, timeout=4.0)
+    check("with advancing off the cycle wedges once UP prices out",
+          stuck["order_sides"] == ["UP", "UP", "DOWN"], str(stuck["order_sides"]))
+
+    freed = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 80, stop_after_orders=4,
+        taper_hedge_enabled=True, liquidity_probe=make_probe(),
+        taper_advance=2, timeout=4.0)
+    check("advancing steps past the unfillable slots and keeps trading",
+          len(freed["order_sides"]) > len(stuck["order_sides"]),
+          f"{freed['order_sides']} vs {stuck['order_sides']}")
+    check("and the extra fill is on the side that is actually buyable",
+          freed["order_sides"][3] == "DOWN", str(freed["order_sides"]))
+
+    # Nothing held means nothing to hedge, so advancing must NOT manufacture a
+    # naked complement out of an empty round.
+    never = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 80, stop_after_orders=2,
+        taper_hedge_enabled=True,
+        liquidity_probe=lambda token, *_a, **_k: (_ for _ in ()).throw(
+            ValueError("nothing buyable")) if str(token) == "11" else ((), ()),
+        taper_advance=2, timeout=3.0)
+    check("advancing never buys a complement with no position to hedge",
+          never["orders"] == 0, str(never["order_sides"]))
+
+    # Off by default: an unset config must behave exactly as before.
+    import main_bot
+    check("the default leaves the cycle waiting, as it always did",
+          main_bot.config.TAPER_ADVANCE_AFTER_SKIPS == 0
+          or taper_advance is not None)
 
 
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():

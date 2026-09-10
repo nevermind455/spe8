@@ -720,6 +720,12 @@ async def run_bot():
             # side. TAPER_HEDGE_ENABLED reads this to decide whether the next
             # confirmation still grows the primary side or now funds a hedge.
             taper_count = 0
+            # Consecutive attempts that picked a slot and failed to fill it,
+            # and whether the last such attempt is still outstanding. Drives
+            # TAPER_ADVANCE_AFTER_SKIPS so a slot whose side has priced out of
+            # the band cannot hold the cycle for the rest of the round.
+            taper_skips = 0
+            taper_slot_pending = False
             # The side entry 1 actually bought. Later slots in the SAME
             # cycle anchor to this rather than to the live signal; a flip in
             # the signal retires the cycle and re-anchors here instead.
@@ -1241,6 +1247,22 @@ async def run_bot():
             taper_anchor_side = None
             taper_active = config.TAPER_HEDGE_ENABLED and mode == "PAPER"
             if taper_active:
+                # A slot that keeps failing to fill has to be stepped past.
+                # Slots 1 and 2 both buy the anchored side, so a side priced
+                # outside the band blocks them BOTH - and blocks the cycle
+                # from ever reaching slot 3, the complement, which is the leg
+                # that is cheap precisely when the anchor is expensive.
+                if taper_slot_pending:
+                    taper_skips += 1
+                    limit = config.TAPER_ADVANCE_AFTER_SKIPS
+                    if limit and taper_skips >= limit:
+                        taper_count += 1
+                        taper_skips = 0
+                        print(f"{_ts()} [TAPER] slot unfilled after {limit} "
+                              f"attempts; advancing to slot "
+                              f"{taper_count % 3 + 1}/3.")
+                taper_slot_pending = True
+
                 # Follow the signal. A cycle is a bet on one side; once the
                 # signal has left that side, continuing to grow it - or to
                 # buy its complement as a "hedge" for a position the bot no
@@ -1813,6 +1835,8 @@ async def run_bot():
                     chainlink_start=start_chainlink_price))
             if ok:
                 round_exposure += entry_ceiling
+                taper_skips = 0
+                taper_slot_pending = False
                 if taper_active and taper_count == 0:
                     # Lock in what entry 1 actually bought - every later
                     # taper decision this round (including which side any
