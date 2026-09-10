@@ -341,6 +341,23 @@ class _RoundSignalEpoch:
         return True, "verified transition of the deciding signal"
 
 
+def _signals_unanimous(price_side, book_side, chainlink_side) -> bool:
+    """True when every signal that voted names the same side.
+
+    A neutral or missing signal abstains rather than dissenting - the same
+    rule strategy.minority_decision uses - so a round where CHAINLINK is
+    absent can still be unanimous on the two that spoke.
+
+    Measured over 894 settled fills, positions opened on a contested read won
+    46% of the time against 60% for unanimous ones. See
+    config.REQUIRE_SIGNAL_UNANIMITY for the full figures, including the
+    caveat that both groups still lost money.
+    """
+    votes = [s for s in (price_side, book_side, chainlink_side)
+             if s in ("UP", "DOWN")]
+    return bool(votes) and len(set(votes)) == 1
+
+
 def _authority_side(price_side, book_side, chainlink_side):
     """The signal that actually decides the order side under this config.
 
@@ -1275,6 +1292,19 @@ async def run_bot():
                                else config.PRIMARY_ENTRY_MAX_PRICE)
             entry_min_price = (config.MIN_BUY_PRICE if is_taper_hedge
                                else config.PRIMARY_ENTRY_MIN_PRICE)
+
+            # A contested read is a coin flip that still pays a spread. This
+            # does NOT disturb the taper cadence: taper_count advances only on
+            # a fill, so a refused attempt leaves the cycle on the same slot
+            # and it resumes there - the 2:1 shape is defined over fills, not
+            # attempts.
+            if (config.REQUIRE_SIGNAL_UNANIMITY
+                    and not _signals_unanimous(price_side, book_side, chainlink_side)):
+                print(f"{_ts()} [RISK] No order: signals are contested "
+                      f"(price={price_side or 'n/a'} book={book_side or 'n/a'} "
+                      f"chainlink={chainlink_side or 'n/a'}); unanimity required.")
+                await _cooldown()
+                continue
 
             frozen_reason = _unsettled_exposure_block()
             if frozen_reason:

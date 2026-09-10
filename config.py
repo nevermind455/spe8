@@ -377,6 +377,24 @@ if SIGNAL_DECISION_RULE not in {"price", "minority", "final"}:
     raise ValueError(
         "SIGNAL_DECISION_RULE must be one of: price, minority, final")
 
+# Refuse a phase-2 entry unless every signal that voted agrees. A signal that
+# abstained does not count against unanimity - silence is not dissent.
+#
+# Measured over 894 settled fills, split by whether any signal dissented:
+#
+#     UNANIMOUS  648 fills  $2104.89  -5.7%  60% of positions won
+#     CONTESTED  246 fills  $ 692.92  -6.7%  46% of positions won
+#
+# Filtering to unanimous only would have moved total P&L -165.66 -> -119.01
+# (+46.65) and cut capital at risk by 25%. Read that honestly: BOTH groups
+# lose, and the return improves only 1.0 point. Most of the gain is from
+# trading less, not from finding a winning subset - so this is a turnover
+# brake, not an edge. It is off by default for that reason.
+#
+# Phase 1 is unaffected: the bands are price-only by design and never read
+# BOOK or CHAINLINK, so there is no unanimity to test there.
+REQUIRE_SIGNAL_UNANIMITY = bool(_env_bool("REQUIRE_SIGNAL_UNANIMITY", False))
+
 PHASE2_MULTI_SIGNAL = bool(_env_bool("PHASE2_MULTI_SIGNAL", False))
 if PHASE2_MULTI_SIGNAL and not PHASE2_ENABLED:
     raise ValueError("PHASE2_MULTI_SIGNAL requires PHASE2_ENABLED=1")

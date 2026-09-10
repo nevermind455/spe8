@@ -1650,7 +1650,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # a cap on cash committed to rounds the venue has not resolved. Default 0
     # (off). Per-round exposure could not see a settlement stall freezing 103%
     # of a wallet across 20 open rounds.
-    "main_bot.py": "972eea7ab80acda3f9692325381b0fe4c07bf9e4268b1236145d3df8ec703b1c",
+    # main_bot.py, config.py re-approved 2026-09-10: REQUIRE_SIGNAL_UNANIMITY,
+    # a phase-2 filter refusing contested reads. Default off. Measured over 894
+    # settled fills: contested 46% of positions won vs 60% unanimous, but both
+    # groups lost - it is a turnover brake, not an edge.
+    "main_bot.py": "caa98bb152bba560942bf78da8fc71b528c788e6def177150ad8fdfe1dee605b",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
@@ -1658,7 +1662,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "01eb629c44fbeffbe8a2736f2b8278cba2482402def1192c544bf44b6a14bfc2",
+    "config.py": "92cbb20bcbfa27d29c602dbc6c94b8859abad3fbcb98dbbfe66874232fe7e15f",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

@@ -1125,7 +1125,7 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   taper_hedge_enabled=False, token_books=None,
                                   liquidity_probe=None, primary_band=None,
                                   decision_rule=None, unsettled_provider=None,
-                                  max_unsettled=0.0):
+                                  max_unsettled=0.0, require_unanimity=False):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1243,6 +1243,7 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot.config, "SIGNAL_DECISION_RULE",
                 decision_rule or ("minority" if minority_rule else "price"))
         replace(main_bot.config, "MAX_UNSETTLED_EXPOSURE", max_unsettled)
+        replace(main_bot.config, "REQUIRE_SIGNAL_UNANIMITY", require_unanimity)
         replace(main_bot, "_unsettled_exposure_provider", unsettled_provider)
         replace(main_bot.config, "TAPER_HEDGE_ENABLED", taper_hedge_enabled)
         if primary_band is not None:
@@ -1908,6 +1909,58 @@ async def t_unsettled_exposure_guard_stops_phase2_entries():
         unsettled_provider=lambda: 10.0, max_unsettled=150.0, timeout=3.0)
     check("orders resume once it is back under the cap",
           clear["orders"] == 1, str(clear["order_sides"]))
+
+
+def t_signal_unanimity_treats_silence_as_abstention_not_dissent():
+    """A missing signal must not make an otherwise-agreed read "contested"."""
+    import main_bot
+    u = main_bot._signals_unanimous
+    check("all three agreeing is unanimous", u("UP", "UP", "UP"))
+    check("two agreeing with the third absent is still unanimous",
+          u("UP", "UP", None))
+    check("a lone voter is unanimous", u(None, "DOWN", None))
+    check("one dissenter breaks it", not u("UP", "UP", "DOWN"))
+    check("a 1-1 split is not unanimous", not u("UP", "DOWN", None))
+    check("no votes at all is not unanimous", not u(None, None, None))
+
+
+async def t_unanimity_filter_refuses_contested_reads_without_breaking_cadence():
+    """Contested reads are skipped, and the taper cycle keeps its place.
+
+    The cadence is defined over FILLS - taper_count advances only when an
+    order fills - so a refused attempt leaves the cycle on the same slot
+    rather than restarting it. That is the property that lets a filter and
+    the 2:1 cycle coexist; resetting the counter is what broke it before.
+    """
+    # price=UP book=DOWN -> contested. Nothing may be sent.
+    contested = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 20, book_vote="DOWN", chainlink_vote="DOWN",
+        require_unanimity=True, stop_after_orders=1, timeout=1.5)
+    check("a contested read places no order", contested["orders"] == 0,
+          str(contested["order_sides"]))
+
+    # Same signals, filter off -> it trades, proving the filter is the cause.
+    off = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 20, book_vote="DOWN", chainlink_vote="DOWN",
+        require_unanimity=False, stop_after_orders=1, timeout=3.0)
+    check("the same read trades with the filter off", off["orders"] == 1,
+          str(off["order_sides"]))
+
+    # Unanimous reads pass, and the cadence still runs 2 signal : 1 opposite.
+    agreed = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 40, book_vote="UP", chainlink_vote="UP",
+        require_unanimity=True, taper_hedge_enabled=True,
+        stop_after_orders=6, timeout=4.0)
+    check("unanimous reads are traded",
+          agreed["order_sides"] == ["UP", "UP", "DOWN", "UP", "UP", "DOWN"],
+          str(agreed["order_sides"]))
+    check("and the filter leaves the 2:1 cadence intact",
+          [round(a, 2) for a in agreed["order_amounts"]]
+          == [3.0, 2.0, 1.0, 3.0, 2.0, 1.0],
+          str(agreed["order_amounts"]))
 
 
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():
