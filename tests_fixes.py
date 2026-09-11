@@ -2225,6 +2225,34 @@ def t_boundary_backfill_retry_settings_are_validated():
                          BOUNDARY_BACKFILL_RETRY_GAP="10") is None)
 
 
+def t_entry_cost_ceiling_charges_what_the_slot_actually_stakes():
+    """The round cap must charge the real order, not always BET_SIZE.
+
+    It took only a price cap and charged max(BET_SIZE, 5 x cap). That merely
+    OVER-charged while every entry was BET_SIZE or smaller, so it was safe by
+    accident. A taper ladder stakes per slot: a $5 slot really costs up to
+    $5.28 against the $4.28 charged, so MAX_ROUND_EXPOSURE under-counts by
+    19% and stops bounding what it claims to.
+    """
+    import main_bot
+    cfg = main_bot.config
+    cap = cfg.MAX_BUY_PRICE
+    base = cfg.entry_cost_ceiling(cap)
+    check("no amount still means BET_SIZE, so existing callers are unchanged",
+          base == cfg.entry_cost_ceiling(cap, cfg.BET_SIZE), str(base))
+
+    big = cfg.entry_cost_ceiling(cap, 5.0)
+    check("a stake above the venue minimum raises the charge",
+          big > base, f"{big} vs {base}")
+    check("and covers the real worst-case cost of that stake",
+          big >= 5.0 * (1.0 + cfg.TAKER_FEE_RATE) - 1e-9, str(big))
+
+    small = cfg.entry_cost_ceiling(cap, 1.5)
+    check("a stake below the venue minimum still charges the minimum",
+          abs(small - base) < 1e-9,
+          f"{small} vs {base} - 5 shares at the cap is the real floor")
+
+
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():
     """A hedge leg must not die because the PRIMARY side's book blipped.
 

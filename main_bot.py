@@ -1384,7 +1384,11 @@ async def run_bot():
                 await _cooldown()
                 continue
 
-            entry_ceiling = config.entry_cost_ceiling(config.MAX_BUY_PRICE)
+            # Charged against what this slot actually stakes. A taper ladder
+            # sizes per slot, so charging BET_SIZE for a $5 slot under-counts
+            # the round cap by the difference.
+            entry_ceiling = config.entry_cost_ceiling(
+                config.MAX_BUY_PRICE, entry_amount)
             if round_exposure + entry_ceiling > config.MAX_ROUND_EXPOSURE + 1e-9:
                 print(
                     f"{_ts()} [RISK] Round exposure cap reached "

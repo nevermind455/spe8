@@ -595,7 +595,7 @@ for _taper_name, _taper_value in (
 del _taper_name, _taper_value
 
 
-def entry_cost_ceiling(cap_price: float) -> float:
+def entry_cost_ceiling(cap_price: float, amount: float | None = None) -> float:
     """The most one entry can take out of the account at this price cap.
 
     BUGFIX: main_bot used to charge MAX_ROUND_EXPOSURE exactly BET_SIZE per
@@ -604,8 +604,18 @@ def entry_cost_ceiling(cap_price: float) -> float:
     on a real paper run the tracker was 22% low overall and 76% low on one
     round, which made the cap nominal rather than real. A limit has to use an
     upper bound, so this returns one.
+
+    BUGFIX 2: it also ignored what the order actually stakes, charging
+    BET_SIZE however large the entry was. That was harmless while every
+    entry was BET_SIZE or smaller - it merely over-charged - but a taper
+    ladder stakes per slot, and a $5 slot really costs up to $5.28 against
+    the $4.28 charged. The cap silently under-counts by 19% and stops
+    meaning what it says. `amount` defaults to BET_SIZE so every existing
+    caller (phase-1 bands, the multi-signal legs, the round budget) is
+    unchanged.
     """
-    notional = max(float(BET_SIZE), VENUE_MIN_SHARES * float(cap_price))
+    stake = float(BET_SIZE if amount is None else amount)
+    notional = max(stake, VENUE_MIN_SHARES * float(cap_price))
     return notional * (1.0 + TAKER_FEE_RATE)
 
 

@@ -855,7 +855,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # recovery now retries (BOUNDARY_BACKFILL_RETRIES) instead of running once.
     # A single timeout used to leave a round with no strike, and 10% of rounds
     # the bot was up for produced no trade at all.
-    "main_bot.py": "698f303e0db04319411db66e200e3aabeca08b120b50482f078840e2c4e215f8",
+    # main_bot.py, config.py re-approved 2026-09-12: entry_cost_ceiling now
+    # charges the slot's real stake. It always charged BET_SIZE, which merely
+    # over-charged until a taper ladder staked $5 per slot - then the round cap
+    # under-counted by 19%.
+    "main_bot.py": "6443cc3e17b9aa588a53468b586165b3413829be303147b1fcd0c9e3fb1a2ef5",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
@@ -863,7 +867,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "f2cc6fe2fc5da0c04cd3d6c1613877bb0d0ae8ac8bda7b8648077f8a75b3e55e",
+    "config.py": "1a96307493a98550dd9fcdb029c6cf908d846d54b3c80fa9b70d3ff59c83aa4f",
 }
 
 
