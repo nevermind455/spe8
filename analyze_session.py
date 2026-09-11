@@ -133,7 +133,8 @@ def main(argv) -> int:
                 for r in rows}
     legs = collections.defaultdict(
         lambda: {"n": 0, "cost": 0.0, "pay": 0.0, "px": 0.0, "won": 0})
-    bands = collections.defaultdict(lambda: {"n": 0, "cost": 0.0, "pay": 0.0})
+    bands = collections.defaultdict(
+        lambda: {"n": 0, "cost": 0.0, "pay": 0.0, "px": 0.0, "won": 0})
     for o in filled:
         q = pos.get(str(o["token_id"]))
         if not q or not q.get("settled"):
@@ -155,6 +156,8 @@ def main(argv) -> int:
         b["n"] += 1
         b["cost"] += o["total_cost"]
         b["pay"] += pay
+        b["px"] += px
+        b["won"] += (pay > 0)
 
     if legs:
         print(f"\n{'LEG':<9}{'fills':>6}{'avg px':>8}{'cost':>10}{'P&L':>10}"
@@ -173,22 +176,46 @@ def main(argv) -> int:
         print("   signal is worse than the quote it is paying.")
 
     if bands:
-        print(f"\n{'PRICE BAND':<12}{'fills':>6}{'cost':>10}{'P&L':>10}"
-              f"{'return':>9}")
+        print(f"\n{'PRICE BAND':<12}{'fills':>6}{'avg px':>8}{'cost':>10}"
+              f"{'P&L':>10}{'return':>9}{'won':>7}{'EDGE':>8}{'fee':>7}")
         for band in ("<0.15", "0.15-0.30", "0.30-0.50", "0.50-0.70", ">=0.70"):
             b = bands.get(band)
-            if not b or not b["cost"]:
+            if not b or not b["cost"] or not b["n"]:
                 continue
             pnl = b["pay"] - b["cost"]
-            print(f"{band:<12}{b['n']:>6}{b['cost']:>10.2f}{pnl:>+10.2f}"
-                  f"{pnl / b['cost'] * 100:>8.1f}%")
+            avg_px = b["px"] / b["n"]
+            win = b["won"] / b["n"]
+            # The taker fee is theta*(1-p) per dollar of notional, so a cheap
+            # fill costs MORE in fees than an expensive one. Shown beside the
+            # edge because it is what the edge has to clear, and it is a large
+            # part of why the low bands read worse than the high ones.
+            fee = 0.07 * (1 - avg_px)
+            print(f"{band:<12}{b['n']:>6}{avg_px:>8.3f}{b['cost']:>10.2f}"
+                  f"{pnl:>+10.2f}{pnl / b['cost'] * 100:>8.1f}%"
+                  f"{win * 100:>6.0f}%{win - avg_px:>+8.3f}{fee * 100:>6.1f}%")
+        print("   EDGE is gross of fees; the fee column is what it must clear.")
 
     # --------------------------------------------------- decision rules --
     if strategy is not None:
         side_of = {str(o["token_id"]): o["side"] for o in filled}
-        winner = {q["condition_id"]: side_of.get(str(t))
-                  for t, q in pos.items()
-                  if q.get("settled") and q.get("payout_per_share")}
+        # Derive the winner from a LOSING position too. Recording it only
+        # where we happened to hold the winner drops every round the bot got
+        # wrong, which is a 12% exclusion of exactly the wrong rounds and
+        # biases every hit rate upward. In a binary market a token that paid
+        # zero tells us the other side won, which is the same information.
+        winner = {}
+        for t, q in pos.items():
+            if not q.get("settled"):
+                continue
+            side = side_of.get(str(t))
+            pay = q.get("payout_per_share")
+            if side is None or pay is None:
+                continue
+            if pay > 0.9:
+                winner[q["condition_id"]] = side
+            elif pay < 0.1:
+                winner[q["condition_id"]] = "DOWN" if side == "UP" else "UP"
+            # a 50/50 resolution has no winning side; leave it unscored
         sig = {(r.get("time_et"), r.get("side")):
                (r.get("price_side") or None, r.get("book_side") or None,
                 r.get("chainlink_side") or None) for r in rows}
