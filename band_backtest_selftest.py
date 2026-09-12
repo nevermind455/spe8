@@ -110,12 +110,32 @@ def build(path, rounds, delta, seed):
     (path / "signal_journal_winners.json").write_text(json.dumps(winners))
 
 
+def write_paper_fixtures(path):
+    """Give the harness a clean, EMPTY paper fill history.
+
+    BUGFIX: this used to copy paper_orders.jsonl and paper_ledger.json out of
+    the repo root. Both are gitignored runtime artifacts written by actually
+    running the bot, so on a fresh clone run_case died with FileNotFoundError
+    before a single case executed - the self-test only passed on a machine
+    that had already traded.
+
+    Empty is the correct fixture, not a convenience: every case here asserts
+    on section 4, the JOURNAL backtest, which is built from the synthetic
+    journal `build()` writes below. Section 3 replays real paper fills, and
+    seeding it with invented ones would put fabricated trades into the same
+    report the assertions read. An empty history makes section 3 render
+    "NO DATA - untestable", which is exactly what it should say here.
+    """
+    (path / "paper_orders.jsonl").write_text("", encoding="utf-8")
+    (path / "paper_ledger.json").write_text(
+        json.dumps({"positions": {}}), encoding="utf-8")
+
+
 def run_case(name, delta, bands, rounds, seed, expect):
     tmp = pathlib.Path(tempfile.mkdtemp())
     try:
         shutil.copy(ROOT / "band_backtest.py", tmp / "band_backtest.py")
-        for f in ("paper_orders.jsonl", "paper_ledger.json"):
-            shutil.copy(ROOT / f, tmp / f)
+        write_paper_fixtures(tmp)
         build(tmp, rounds, delta, seed)
         proc = subprocess.run(
             [sys.executable, "band_backtest.py", "--bands", bands],

@@ -19,6 +19,22 @@ cp .env.example .env              # optional for paper; edit settings as needed
 chmod 600 .env                    # required on POSIX when .env is used
 ```
 
+`.env.example` lists every setting at its shipped default, so copying it
+changes nothing - it is an inventory to read before you decide to move a
+value. Without a `.env` at all the bot runs those same defaults:
+
+| | shipped default |
+|---|---|
+| phase 1 (price bands) | **on**, `300:240:0.35:0.45,240:180:0.30:0.40,180:120:0.40:0.50,120:60:0.55:0.75:8` |
+| phase 2 (signal entry) | **off** |
+| order-side authority | `SIGNAL_DECISION_RULE=price` - fresh Binance direction |
+| stake / price bounds | `BET_SIZE=2.50`, buy between 0.20 and 0.90 |
+| cadence | last 120s of a round, every 6s, stopping 60s before the close |
+| round cap | derived from the enabled phases (`$72.225` for the above) |
+
+`STRATEGIES.md` describes alternative profiles. Those are opt-in `.env`
+overrides, **not** what runs out of the box.
+
 Never put a real private key in a file you will share or commit. Prefer a
 process supervisor or secret manager for live credentials; see `SECURITY.md`
 for POSIX permissions, Windows ACLs, log handling, and release checks.

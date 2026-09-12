@@ -59,4 +59,5 @@ than two hours remain a live-readiness limitation.
 Deposits, redemptions, manual activity, or missing fills correctly appear as a
 mismatch; this bot does not auto-redeem resolved outcome tokens.
 
-Current deterministic result: `tests_accounting.py` — 151 passed, 0 failed.
+Current deterministic result: `tests_accounting.py` — 175 passed, 0 failed
+(re-measured 2026-09-12).

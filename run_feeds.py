@@ -643,6 +643,7 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     main_bot._round_exposure_provider = None
     main_bot._unsettled_exposure_provider = None
     main_bot._round_held_tokens_provider = None
+    main_bot._round_leg_basis_provider = None
     main_bot._execution_ready_provider = None
 
     broker = None
@@ -883,6 +884,12 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
             import polymarket_trade
             polymarket_trade.set_order_observer(None)
         main_bot._round_exposure_provider = None
+        # BUGFIX: this teardown cleared every provider EXCEPT this one, so a
+        # module global kept a bound method of a closed ledger alive after
+        # run() returned. _unsettled_exposure_block fails closed on a raising
+        # provider, so a stale one cannot open risk - but it can keep the
+        # ledger reachable and makes the shutdown contract inconsistent.
+        main_bot._unsettled_exposure_provider = None
         main_bot._round_held_tokens_provider = None
         main_bot._round_leg_basis_provider = None
         main_bot._execution_ready_provider = None

@@ -145,9 +145,26 @@ def report_fees(name, bands, ask_sum=1.03):
 # ---------------------------------------------------------------- 3. replay
 
 def load_fills():
-    orders = [json.loads(line) for line in open(ROOT / "paper_orders.jsonl")]
+    """Settled paper fills for the censored replay, or [] when there are none.
+
+    BUGFIX: this opened both paper runtime files unconditionally. They are
+    gitignored (they are produced by running the bot), so on a fresh clone
+    the whole tool died with FileNotFoundError before printing anything -
+    including sections 1, 2 and 4, none of which need a fill history at all.
+    Section 4 already degrades to an explicit SKIP when its journal is
+    missing; this now does the same, and report_replay already renders an
+    empty list as "NO DATA - untestable" per window.
+    """
+    audit = ROOT / "paper_orders.jsonl"
+    ledger_path = ROOT / "paper_ledger.json"
+    missing = [p.name for p in (audit, ledger_path) if not p.exists()]
+    if missing:
+        print(f"  (no paper fill history: {', '.join(missing)} not found; "
+              f"the censored replay below has nothing to sample)\n")
+        return []
+    orders = [json.loads(line) for line in open(audit)]
     filled = [o for o in orders if o["status"] == "FILLED"]
-    ledger = json.load(open(ROOT / "paper_ledger.json"))["positions"]
+    ledger = json.load(open(ledger_path))["positions"]
     payout = {t: (p["payout_per_share"] if p.get("settled") else None)
               for t, p in ledger.items()}
     out = []

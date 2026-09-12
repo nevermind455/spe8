@@ -22,10 +22,17 @@ market discovery → round initialization → BTC/Chainlink signal → order boo
 
 `strategy.py` has one narrow post-audit guard: an exactly unchanged finite
 opening/current price now abstains instead of casting a false UP vote. Its
-final SHA-256 is
+SHA-256 **at the 2026-08-12 audit** was
 `95d46436999c5d5cdc24742b0fa4f40842017fe5aa89dcd691f72e4d76b81d91`.
 All non-equality decisions, final consensus, and repeated-entry behavior remain
 intact.
+
+Noted 2026-09-12: that digest is historical. `strategy.py` has since gained
+the `SIG_PRICE_MIN_MOVE_BPS` momentum gate, and its current approved digest
+is `069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878`. The
+authoritative value is the `BASELINE_SHA` table in `tests_feeds.py` and
+`tests_dashboard.py`, which is enforced on every run; this prose is not.
+Do not treat the digest above as a current check.
 
 ## Findings and exact fixes
 
@@ -158,8 +165,20 @@ Intentionally unchanged: `strategy.py`, `dashboard/__init__.py`,
 
 ## Tests performed and results
 
-Original 2026-08-12 deterministic verification (the current follow-up totals
-are recorded at the top of this report):
+Original 2026-08-12 deterministic verification. **These are historical
+figures, not current ones** - read the follow-up totals at the top of this
+report instead. In particular the 77,392 dashboard number below is a
+pre-2026-08-25 harness and is NOT comparable to later runs; the 2026-08-25
+follow-up records 48,929 for the same suite.
+
+Re-measured 2026-09-12 after the hardening patch: `tests_fixes` 404,
+`tests_paper` 135, `tests_accounting` 175, `tests_feeds` 255,
+`tests_dashboard` 49,406, `tests_bugfix` 48, `tests_hardening` 72,
+`run_terminal.py --selftest` PASS, `band_backtest_selftest.py` 7 - all
+passing, 0 failed. The dashboard suite's combinatorial matrices (14x13
+terminal sizes, 10 hash sizes, 21 UI states) are byte-identical to the
+oldest revision in this repository's history and no test function has been
+removed, so the count has only moved upward since then.
 
 | Check | Result |
 |---|---|
@@ -179,6 +198,91 @@ credentialed CLOB SDK was unavailable. It did not fabricate venue data or test
 results: deterministic order responses/books/resolutions are explicitly test
 fixtures, and localhost WebSocket tests use real socket servers. No live order,
 wallet mutation, credential derivation, or 500 resolved-market replay was run.
+
+## SETTLE_ONCHAIN audit (2026-09-12) - documentation only, no behaviour change
+
+`SETTLE_ONCHAIN` is **off by default and stays off**. This section records
+exactly what it changes and exactly how far its central assumption is
+actually proven, because that assumption was previously carried only by a
+one-line source comment.
+
+### What the flag changes
+
+Default settlement (`accounting/resolution.py:fetch`) requires two
+independent surfaces to agree: explicit final CLOB winner flags/payouts AND
+Gamma's explicit oracle resolution for the exact slug/condition, with
+identical payouts. That invariant is untouched by this audit.
+
+With `SETTLE_ONCHAIN=1`, a block ahead of that logic reads the Polygon
+Conditional Tokens contract directly. When the chain answers, `fetch`
+returns `RESOLVED` from that single source and **returns before
+`parse_clob_market` is ever called** - so on this path the CLOB winner flag
+is not consulted and Gamma is not fetched. The two-surface agreement does
+not apply to it. The motive is latency: the chain resolves ~85s after a
+round, the API mirrors ~10 minutes.
+
+### How token ordering is proven - and how far
+
+Payout correctness rests entirely on one mapping. `payouts_for(cid,
+slot_tokens)` reads `payoutNumerators(conditionId, i)` for `i` in `0..1` and
+zips them **positionally** onto the `token_ids` it is handed. `fetch` builds
+that list as:
+
+```python
+slot_tokens = [str((row or {}).get("token_id") or "")
+               for row in (clob_data.get("tokens") or [])]
+```
+
+i.e. the order of the `tokens` array in the CLOB `/markets/{cid}` response.
+So the claim being relied on is: **CLOB `tokens[i].token_id` is the token for
+on-chain outcome slot `i`.**
+
+What actually backs that claim, precisely:
+
+| | status |
+|---|---|
+| Asserted in code | yes - a comment in `resolution.py`: "verified across 9 rounds to match the on-chain outcome-slot order" |
+| Verified at runtime | **no** - nothing compares the chain's winner to any other surface on this path |
+| Guaranteed by the CLOB API contract | **not established** - the ordering is not documented as stable by the venue; the repository cites no specification for it |
+| Sample size behind it | 9 rounds, all presumably the same market type |
+
+`payouts_for` does validate a great deal - a 66-char condition id, a
+distinct binary token pair, `denominator > 0`, numerators summing to the
+denominator, and a split that is cleanly `1/0` or `50/50` - and fails closed
+on every one. **None of those checks can detect a reversed order.** A
+swapped pair still produces a perfectly well-formed single-winner split; it
+simply pays the wrong token. The failure mode is therefore silent and total:
+the loser settles at 1.0, the winner at 0.0, and the ledger records it as
+final. `Ledger.settle` refuses to settle a position twice, so a wrong payout
+written this way is not self-correcting.
+
+Note this is also the one branch where the `50/50` case is inferred rather
+than read: `fetch` labels the winner `"50/50"` when every chain payout is
+0.5, which is order-independent and therefore unaffected.
+
+### What would actually prove it
+
+Nothing below is implemented, by design - this audit changes no settlement
+behaviour.
+
+1. **Cheap runtime cross-check.** When the chain answers AND the CLOB
+   response already carries an explicit winner, compare them and fail closed
+   on disagreement. `clob_data` is in hand at that point, so this costs no
+   extra request. It would turn a silent inversion into a refusal.
+2. **Derive the mapping instead of assuming it.** Compute each outcome
+   slot's position id from `conditionId` and the index set, and match tokens
+   by that rather than by array position. This removes the assumption
+   entirely rather than checking it.
+3. **Widen the sample.** 9 rounds is not enough to call an undocumented API
+   ordering stable. Record chain-vs-CLOB winner agreement over a few hundred
+   settled rounds before trusting it unsupervised.
+
+### Operating guidance until then
+
+Leave `SETTLE_ONCHAIN=0` (the default) for any run whose PnL matters.
+`SETTLE_TRUST_GAMMA` carries a smaller version of the same caveat: it lets a
+`PENDING` (merely lagging) CLOB surface be settled from Gamma alone, though
+it still fails closed on `UNKNOWN`. Both are listed, off, in `.env.example`.
 
 ## Remaining risks
 

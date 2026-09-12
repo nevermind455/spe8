@@ -1670,7 +1670,23 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # charges the slot's real stake. It always charged BET_SIZE, which merely
     # over-charged until a taper ladder staked $5 per slot - then the round cap
     # under-counted by 19%.
-    "main_bot.py": "6443cc3e17b9aa588a53468b586165b3413829be303147b1fcd0c9e3fb1a2ef5",
+    # main_bot.py re-approved 2026-09-12: hardening patch, NO strategy change.
+    # (1) phase 2 gained a monotonic cadence gate - _phase2_deadline - stamped
+    # on entry like phase 1's last_phase1, so all 33 of its exit paths wait a
+    # full TRADE_INTERVAL_SECONDS instead of the 14 that re-entered on a bare
+    # 0.2s sleep. Measured before: 25 CLOB /book reads in 5s on a neutral
+    # signal; after: 1. The blocking _cooldown helper is replaced by the
+    # deadline, so the loop no longer stalls across a round boundary.
+    # (2) the pre-submit guards no longer perform network I/O: SIG BOOK is
+    # pre-fetched off PaperBroker._lock and passed in as an immutable
+    # snapshot, and an unread snapshot fails closed instead of abstaining.
+    # (3) an unreadable order book is classified explicitly (_book_vote /
+    # BOOK_NO_READ) so a failed refresh can no longer be recorded as a
+    # genuine one-sided abstention at the submit gate.
+    # Entry bands, stake sizing, SIGNAL_DECISION_RULE, _authority_side, the
+    # taper cadence and the reversal epoch are all untouched; strategy.py and
+    # config.py are byte-identical.
+    "main_bot.py": "4a2195ab8d7e17a70421df54b0eb550e8e65fd702af1cf8d1655aeb443a82bb3",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",

@@ -55,7 +55,8 @@ submission. REST is defense-in-depth, not the sole live fill channel.
 `USER_WS=on`, and `RECONCILE=auto` are the shipped settings. Paper and health
 mode force private user/reconciliation feeds off before tasks are created.
 
-Current deterministic result: `tests_feeds.py` — 243 passed, 0 failed,
+Current deterministic result: `tests_feeds.py` — 255 passed, 0 failed
+(re-measured 2026-09-12),
 including localhost WebSocket disconnect/reconnect, heartbeat, stale-data,
 book atomicity, rotation, fill lifecycle, reconciliation, process-lock, and
 strategy-hash regression checks.

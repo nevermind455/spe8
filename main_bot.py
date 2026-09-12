@@ -147,9 +147,74 @@ def chainlink_signal(round_key: int, start_price, current_price):
     return strategy.decide(start_price, current_price)
 
 
+# Explicit states for one order-book read, so an unreadable book is never
+# silently indistinguishable from a book that genuinely has nothing to say.
+#
+# BUGFIX: the phase-2 submit gate computed SIG BOOK as
+# `liquidity_signal(selected_bids, selected_asks)` where a failed taper
+# liquidity probe had already set those to `(), ()`. liquidity_signal returns
+# None for an empty book - the same value it returns when a real, healthy book
+# is one-sided near expiry - so a failed refresh was recorded as a genuine
+# abstention. Under a rule that reads BOOK that silently changed the authority
+# side and rejected sound orders; it also wrote an empty `book_side` into the
+# trade journal for a decision that did have a book signal.
+BOOK_OK = "ok"
+BOOK_ONE_SIDED = "one_sided"
+BOOK_EMPTY = "empty"
+BOOK_UNAVAILABLE = "unavailable"
+# States that carry no usable information about the venue's depth. These are
+# NOT votes and must never be passed off as one; a caller either falls back to
+# the last book it actually read, or refuses the order.
+BOOK_NO_READ = (BOOK_EMPTY, BOOK_UNAVAILABLE)
+
+
+def _freeze_book(book):
+    """Return an immutable ``(bids, asks)`` copy, or None if unreadable.
+
+    The pre-submit guard evaluates this while the broker holds its state
+    lock, so the value it reads must not be a structure another thread can
+    still be mutating.
+    """
+    try:
+        bids, asks = book
+    except (TypeError, ValueError):
+        return None
+    try:
+        return (tuple(dict(level) for level in (bids or ())),
+                tuple(dict(level) for level in (asks or ())))
+    except (TypeError, ValueError):
+        return None
+
+
+def _book_vote(book) -> tuple[str | None, str]:
+    """Classify one book read as ``(vote, state)``.
+
+    `one_sided` is a real abstention - near expiry the winning token keeps
+    only bids and the loser only asks, and orderbook.liquidity_signal
+    deliberately declines to read that as depth. `empty` and `unavailable`
+    are the absence of a read, which is a different thing entirely.
+    """
+    if book is None:
+        return None, BOOK_UNAVAILABLE
+    try:
+        bids, asks = book
+    except (TypeError, ValueError):
+        return None, BOOK_UNAVAILABLE
+    if not bids and not asks:
+        return None, BOOK_EMPTY
+    try:
+        vote = orderbook.liquidity_signal(bids, asks)
+    except Exception:
+        return None, BOOK_UNAVAILABLE
+    if vote not in ("UP", "DOWN"):
+        return None, BOOK_ONE_SIDED
+    return vote, BOOK_OK
+
+
 def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
                         signal_observer=None, book_token: str | None = None,
-                        chainlink_start=None, explain=False):
+                        book_snapshot=None, chainlink_start=None,
+                        explain=False):
     """Authorize one irreversible order step against the latest signal.
 
     The executor calls this after its own blocking work (and again for each
@@ -166,6 +231,24 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
     and a stale pick could slip through whenever SIG PRICE alone happened to
     coincide with it.  Callers that never pass `book_token` (phase 1 bands,
     which are price-only by design) keep the SIG-PRICE-only behavior.
+
+    This guard runs inside the broker's state lock, immediately before the
+    durable fill, so it performs NO network I/O.  SIG PRICE and SIG CHAINLINK
+    are in-memory feed reads and stay live here.  SIG BOOK is REST-only, so
+    the caller pre-fetches it off the lock and hands it in as
+    `book_snapshot`; this function never calls orderbook.get_orderbook.
+
+    BUGFIX: it used to do exactly that - an 8s-timeout, once-retried REST read
+    (so up to ~16s) while holding paper_trade.PaperBroker._lock, the same lock
+    cash_balance() and the dashboard need.  main_bot's own multi-signal branch
+    documents why that is not allowed and re-checks SIG BOOK off the lock; the
+    primary entry path did the opposite of what that comment describes.
+
+    A missing or unreadable `book_snapshot` under a rule that reads BOOK fails
+    CLOSED with a precise reason.  It previously became `book_side = None`, an
+    abstention indistinguishable from a genuinely one-sided book - which under
+    `final`/`minority` can move the authority side, so a failed REST read was
+    quietly able to change which side the order was validated against.
     """
     def reject(reason):
         return polymarket_trade.GuardRejection(reason) if explain else False
@@ -198,12 +281,15 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
             return reject("price sample belongs to a different round")
         sampled_side = price_signal(round_key, start_price, current_price)
         if config.SIGNAL_DECISION_RULE != "price" and book_token is not None:
-            book_side = None
-            try:
-                bids, asks = orderbook.get_orderbook(book_token)
-                book_side = orderbook.liquidity_signal(bids, asks)
-            except Exception:
-                book_side = None
+            # No network here: the snapshot was read off the broker lock.
+            book_side, book_state = _book_vote(book_snapshot)
+            if book_state in BOOK_NO_READ:
+                if signal_observer is not None:
+                    signal_observer(None)
+                print(f"{_ts()} [GUARD] pre-submit refused: SIG BOOK snapshot "
+                      f"is {book_state}; refusing rather than recording an "
+                      f"unread book as an abstention.")
+                return reject(f"SIG BOOK snapshot is {book_state}")
             chainlink_side = chainlink_signal(
                 round_key, chainlink_start, current_chainlink_twap())
             authority_side = _authority_side(sampled_side, book_side, chainlink_side)
@@ -234,8 +320,7 @@ def _fresh_price_permit(round_key: int, start_price, expected_side: str, *,
 
 
 def _fresh_signal_permit(source: str, expected_side: str, *, round_key: int,
-                         chainlink_start=None, book_token: str | None = None,
-                         ) -> bool:
+                         chainlink_start=None, book_snapshot=None) -> bool:
     """Re-check the signal that selected a multi-signal leg, before the fill.
 
     The price path has ``_fresh_price_permit`` for this; SIG BOOK and SIG
@@ -243,6 +328,12 @@ def _fresh_signal_permit(source: str, expected_side: str, *, round_key: int,
     signal that chose its side. Runs inside the broker's pre-submit callback,
     after the modeled latency, so it re-reads live state rather than reusing
     the value that opened the attempt. Anything unreadable fails closed.
+
+    Like ``_fresh_price_permit`` this runs while the broker holds its state
+    lock and therefore performs NO network I/O. SIG CHAINLINK is an in-memory
+    TWAP read and stays live. SIG BOOK is REST-only, so it is pre-fetched off
+    the lock by the caller and passed in as `book_snapshot`; an absent or
+    unreadable snapshot fails closed rather than abstaining.
     """
     if expected_side not in ("UP", "DOWN"):
         return False
@@ -252,10 +343,10 @@ def _fresh_signal_permit(source: str, expected_side: str, *, round_key: int,
                 round_key, chainlink_start, current_chainlink_twap()
             ) == expected_side
         if source == "book":
-            if not book_token:
+            vote, state = _book_vote(book_snapshot)
+            if state in BOOK_NO_READ:
                 return False
-            bids, asks = orderbook.get_orderbook(book_token)
-            return orderbook.liquidity_signal(bids, asks) == expected_side
+            return vote == expected_side
     except Exception:
         return False
     return False
@@ -498,25 +589,45 @@ def _append_trade(row):
         print(f"{_ts()} [LOG] Trade CSV write failed: {type(exc).__name__}")
 
 
-async def _cooldown(seconds: float | None = None) -> None:
-    """Wait out the trade interval, but never across a round boundary.
+def _phase2_deadline(seconds: float | None = None) -> float:
+    """The next monotonic instant at which phase 2 may re-enter.
 
-    BUGFIX: this used to be a flat TRADE_INTERVAL_SECONDS sleep that only woke
-    for shutdown. Round rotation and the opening-print latch both live at the
-    TOP of the strategy loop, so a cooldown beginning a second or two before a
-    boundary held the loop for the rest of its 12s - and the new round was not
-    detected until ~10s in. By then the opening print, which is only latchable
-    from a trade stamped in the first 5 seconds, was already unreachable and
-    the round was lost. Returning at the boundary costs nothing: the loop
-    re-enters, sees the new window, and the interval restarts naturally.
+    BUGFIX: phase 2 had no cadence stamp of its own. `_cooldown()` at the
+    bottom of the block was the ONLY thing enforcing TRADE_INTERVAL_SECONDS,
+    so any of the 14 skip paths that `continue`d on a bare `sleep(0.2)`
+    re-entered the whole block five times a second - re-running discovery,
+    the durable-state refresh and a full CLOB /book read each time. Measured
+    with a stubbed harness at a neutral SIG PRICE: 25 book reads in 5s
+    (5.0 req/s, ~300 per 60s trade window) plus 15 log lines a second, for as
+    long as the condition held. A neutral signal under SIG_PRICE_MIN_MOVE_BPS,
+    a dropped Binance print during a socket reconnect, or a LIVE user-WS
+    outage each hold that condition for seconds at a time.
+
+    Phase 1 never had this problem because it stamps `last_phase1` on entry.
+    This is the same mechanism for phase 2, expressed as a monotonic deadline
+    so it cannot be skewed by a wall-clock correction mid-round.
+
+    `seconds` may ask for a LONGER wait, never a shorter one: every phase-2
+    exit path - success, skip, risk refusal, REST failure - waits at least
+    one full trade interval before the next attempt.
+
+    This replaces the `_cooldown()` helper, which slept the interval inline.
+    That sleep only woke for shutdown, so a cooldown beginning a second or
+    two before a boundary held the loop for the rest of its interval and the
+    new round was not detected until well into it - by which time the opening
+    print, latchable only from a trade stamped in the first 5 seconds, was
+    already unreachable. A deadline does not hold the loop at all: rotation,
+    the strike latch and the status line keep running at the top of the loop
+    while phase 2 waits, and the boundary reset below re-arms the gate for
+    the new round. Same cadence, no blocked loop.
     """
-    gap = config.TRADE_INTERVAL_SECONDS if seconds is None else seconds
-    deadline = time.monotonic() + gap
-    entry_window = timer.window_start()
-    while time.monotonic() < deadline and not stop_event.is_set():
-        if timer.window_start() != entry_window:
-            return
-        await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    gap = config.TRADE_INTERVAL_SECONDS
+    if seconds is not None:
+        try:
+            gap = max(float(seconds), gap)
+        except (TypeError, ValueError):
+            gap = config.TRADE_INTERVAL_SECONDS
+    return time.monotonic() + gap
 
 
 def _pair_lock_permit(condition_id: str | None, other_token: str,
@@ -621,7 +732,13 @@ async def run_bot():
     # path that reaches it without a final read. The sentinel token matches no
     # real token id, so the fallback is always a fresh fetch.
     final_book_token, final_book_mono = None, 0.0
+    # Same defensive reason: a path that reaches the submit gate without a
+    # successful final read must see an explicit "no read", never a NameError
+    # and never a stale vote from the previous round.
+    final_book_side, final_book_state = None, BOOK_UNAVAILABLE
     last_phase1 = 0.0
+    # Monotonic cadence gate for phase 2 - see _phase2_deadline.
+    phase2_gate_until = 0.0
     signal_epoch = _RoundSignalEpoch()
 
     mode = str(execution_mode or "LIVE").upper()
@@ -730,6 +847,9 @@ async def run_bot():
             # both legs of the same market) and when we last attempted.
             held_tokens = set()
             last_phase1 = 0.0
+            # A new round starts its own cadence: a gate armed by the round
+            # that just closed must not delay the first attempt of this one.
+            phase2_gate_until = 0.0
             # How many phase-2 entries have filled this round, regardless of
             # side. TAPER_HEDGE_ENABLED reads this to decide whether the next
             # confirmation still grows the primary side or now funds a hedge.
@@ -1106,7 +1226,15 @@ async def run_bot():
 
         if (config.PHASE2_ENABLED
                 and 0 < exact_remaining <= config.TRADE_LAST_SECONDS
-                and exact_remaining >= config.MIN_SECONDS_TO_EXPIRY):
+                and exact_remaining >= config.MIN_SECONDS_TO_EXPIRY
+                and time.monotonic() >= phase2_gate_until):
+            # Stamp the cadence BEFORE any work, exactly as phase 1 stamps
+            # last_phase1. Every `continue` below - including the ones that
+            # fail before reaching the bottom of the block - is therefore
+            # gated for a full trade interval by default, and a path that
+            # wants to re-stamp from a later instant assigns the deadline
+            # again. Nothing inside can re-enter at 5 Hz.
+            phase2_gate_until = _phase2_deadline()
             # Keep each signal on one source: Binance start vs Binance now,
             # Chainlink 60s TWAP start vs Chainlink 60s TWAP now.  Mixing a
             # TWAP strike with a spot current value silently flips close calls.
@@ -1152,7 +1280,7 @@ async def run_bot():
                         )
                 else:
                     print(f"{_ts()} [RISK] No order: missing {', '.join(missing)}.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             print(f"{_ts()} [BOT] Trade window ({exact_remaining:.2f}s left) - validating live state...")
@@ -1166,12 +1294,12 @@ async def run_bot():
             tokens = round_tokens
             if not tokens:
                 print(f"{_ts()} [BOT] WARN: No market tokens - cannot place order.")
-                await _cooldown(1.0)
+                phase2_gate_until = _phase2_deadline(1.0)
                 continue
             if (tokens.get("window_start") != active_window
                     or tokens.get("window_end") != round_end):
                 print(f"{_ts()} [RISK] No order: discovered market does not match sampled round.")
-                await _cooldown(1.0)
+                phase2_gate_until = _phase2_deadline(1.0)
                 continue
 
             up_id = tokens["up_token_id"]
@@ -1186,7 +1314,7 @@ async def run_bot():
             if not _execution_ready(mode, tokens["condition_id"]):
                 print(f"{_ts()} [RISK] No order: private fill stream is not "
                       "LIVE and subscribed to this market.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             print(f"{_ts()} [BOT] Market tokens found for this round.")
@@ -1213,14 +1341,14 @@ async def run_bot():
                 book_side = orderbook.liquidity_signal(bids, asks)
             except Exception as exc:
                 print(f"{_ts()} [MARKET] Orderbook rejected: {type(exc).__name__}: {exc}")
-                await _cooldown(1.0)
+                phase2_gate_until = _phase2_deadline(1.0)
                 continue
 
             diagnostic_side = strategy.final_decision(
                 price_side, book_side, chainlink_side)
             if price_side is None:
                 print(f"{_ts()} [RISK] No order: fresh SIG PRICE is neutral or unavailable.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
             # Which signal picks the side is SIGNAL_DECISION_RULE's job, and
             # _authority_side is the single place it is read - the same call
@@ -1243,7 +1371,7 @@ async def run_bot():
                 print(f"{_ts()} [RISK] No order: the "
                       f"{config.SIGNAL_DECISION_RULE} rule names no side "
                       f"(signals tied or unanimous-neutral).")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             print(
@@ -1375,13 +1503,13 @@ async def run_bot():
                 print(f"{_ts()} [RISK] No order: signals are contested "
                       f"(price={price_side or 'n/a'} book={book_side or 'n/a'} "
                       f"chainlink={chainlink_side or 'n/a'}); unanimity required.")
-                await _cooldown()
+                phase2_gate_until = _phase2_deadline()
                 continue
 
             frozen_reason = _unsettled_exposure_block()
             if frozen_reason:
                 print(f"{_ts()} [RISK] No order: {frozen_reason}.")
-                await _cooldown()
+                phase2_gate_until = _phase2_deadline()
                 continue
 
             # Charged against what this slot actually stakes. A taper ladder
@@ -1394,7 +1522,7 @@ async def run_bot():
                     f"{_ts()} [RISK] Round exposure cap reached "
                     f"(${round_exposure:.2f}/${config.MAX_ROUND_EXPOSURE:.2f})."
                 )
-                await _cooldown()
+                phase2_gate_until = _phase2_deadline()
                 continue
 
             clock_ok, clock_detail, drift = await asyncio.to_thread(
@@ -1402,11 +1530,11 @@ async def run_bot():
             if mode == "LIVE":
                 if not clock_ok:
                     print(f"{_ts()} [RISK] No order: {clock_detail}.")
-                    await asyncio.sleep(0.5)
+                    phase2_gate_until = _phase2_deadline(0.5)
                     continue
             elif not clock_ok and drift is None and not timer.clock_measured():
                 print(f"{_ts()} [RISK] No order: {clock_detail}.")
-                await asyncio.sleep(0.5)
+                phase2_gate_until = _phase2_deadline(0.5)
                 continue
 
             # Discovery, book reads and clock I/O take time. Re-sample the
@@ -1415,7 +1543,7 @@ async def run_bot():
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed during validation.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             if config.CANCEL_OPEN_BEFORE_TRADE:
@@ -1425,14 +1553,14 @@ async def run_bot():
                 if not cancelled:
                     reason = polymarket_trade.last_order_error or "cancel-all failed"
                     print(f"{_ts()} [RISK] No order because cancellation failed: {reason}")
-                    await asyncio.sleep(0.5)
+                    phase2_gate_until = _phase2_deadline(0.5)
                     continue
 
             action_wall = timer.unix()
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed before submission.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             # Discovery and clock/cancellation I/O can take several seconds.
@@ -1444,7 +1572,7 @@ async def run_bot():
             final_cl = current_chainlink_twap()
             if final_lp is None or final_cl is None:
                 print(f"{_ts()} [RISK] No order: a price feed became stale during validation.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
             try:
                 final_bids, final_asks = await asyncio.to_thread(
@@ -1453,13 +1581,14 @@ async def run_bot():
                 # instead of paying a second round trip for the same leg, but
                 # only while it is provably the same token and still fresh.
                 final_book_token, final_book_mono = ob_id, time.monotonic()
-                final_book_side = orderbook.liquidity_signal(final_bids, final_asks)
+                final_book_side, final_book_state = _book_vote(
+                    (final_bids, final_asks))
             except Exception as exc:
                 print(
                     f"{_ts()} [MARKET] Final orderbook validation failed: "
                     f"{type(exc).__name__}: {exc}"
                 )
-                await _cooldown(1.0)
+                phase2_gate_until = _phase2_deadline(1.0)
                 continue
             final_price_side = price_signal(active_window, start_price, final_lp)
             final_chainlink_side = chainlink_signal(
@@ -1471,7 +1600,7 @@ async def run_bot():
                 final_price_side, final_book_side, final_chainlink_side)
             if final_price_side is None:
                 print(f"{_ts()} [RISK] No order: SIG PRICE became neutral during validation.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
             # Compare against the AUTHORITY side, not raw SIG PRICE: unless
             # SIGNAL_DECISION_RULE is "price", `side` was chosen from all
@@ -1484,7 +1613,7 @@ async def run_bot():
                     f"{_ts()} [RISK] No order: deciding signal changed during "
                     f"validation ({side} -> {final_authority_side})."
                 )
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             other_token = down_id if side == "UP" else up_id
@@ -1511,7 +1640,7 @@ async def run_bot():
                         print(f"{_ts()} [RISK] No order: taper hedge has "
                               f"nothing to hedge yet (no leg filled this "
                               f"round).")
-                        await _cooldown()
+                        phase2_gate_until = _phase2_deadline()
                         continue
                 # else: this attempt grows the already-anchored primary side
                 # further. Whatever else this round holds - a hedge leg on
@@ -1567,7 +1696,7 @@ async def run_bot():
                         f"{_ts()} [RISK] No order: already hold the other leg of "
                         f"this market; {flip_detail}; {lock_detail}."
                     )
-                    await _cooldown()
+                    phase2_gate_until = _phase2_deadline()
                     continue
                 if lock_ok:
                     print(f"{_ts()} [PAIR] completing the pair: {lock_detail}")
@@ -1751,12 +1880,17 @@ async def run_bot():
                             "result": "skipped_unfillable",
                         }
                     )
-                    await _cooldown()
+                    phase2_gate_until = _phase2_deadline()
                     continue
-                selected_bids, selected_asks = (), ()
+                # A failed probe leaves NO book for this leg. It must not
+                # become `(), ()`: an empty book votes None, which is exactly
+                # what a healthy one-sided book votes, so the submit gate
+                # below could not tell a failed refresh from a real
+                # abstention. Carry the absence forward explicitly instead.
+                selected_bids, selected_asks = None, None
             except Exception as exc:
                 print(f"{_ts()} [MARKET] Liquidity probe failed: {type(exc).__name__}: {exc}")
-                await _cooldown(1.0)
+                phase2_gate_until = _phase2_deadline(1.0)
                 continue
 
             validation_limit = min(
@@ -1778,19 +1912,45 @@ async def run_bot():
                     f"{_ts()} [RISK] No order: validation took {validation_age:.3f}s "
                     f"(limit {validation_limit:.3f}s)."
                 )
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             submit_lp, _submit_lp_ts = price_ws.fresh_snapshot(config.BTC_STALE_AFTER)
             submit_cl = current_chainlink_twap()
             if submit_lp is None or submit_cl is None:
                 print(f"{_ts()} [RISK] No order: a price feed went stale before submission.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
-            submit_book_side = (
-                orderbook.liquidity_signal(selected_bids, selected_asks)
-                if side == "UP" else final_book_side
-            )
+            # SIG BOOK for the submit gate. ob_id is always the UP leg
+            # (market_discovery sets it), so only a side=="UP" order has just
+            # re-read the same token the book vote is oriented to; a DOWN
+            # order's own book is the complement and is not that vote.
+            #
+            # A refreshed read is preferred, but only when it is a READ: an
+            # `unavailable`/`empty` state is the absence of one, and falling
+            # back to the last book actually read is what keeps this honest.
+            # Neither branch may invent a vote - a genuinely one-sided book
+            # still abstains, exactly as it did before.
+            if side == "UP":
+                submit_book_side, submit_book_state = _book_vote(
+                    (selected_bids, selected_asks))
+                if submit_book_state in BOOK_NO_READ:
+                    print(f"{_ts()} [MARKET] SIG BOOK refresh came back "
+                          f"{submit_book_state}; reusing the last book read "
+                          f"for this round ({final_book_state}).")
+                    submit_book_side, submit_book_state = (
+                        final_book_side, final_book_state)
+            else:
+                submit_book_side, submit_book_state = (
+                    final_book_side, final_book_state)
+            if submit_book_state in BOOK_NO_READ:
+                # Both the refresh and the fallback failed. Refuse rather
+                # than submit against a book nobody has successfully read.
+                print(f"{_ts()} [RISK] No order: SIG BOOK is "
+                      f"{submit_book_state}; no usable order book for this "
+                      f"leg at submission.")
+                phase2_gate_until = _phase2_deadline()
+                continue
             submit_price_side = price_signal(active_window, start_price, submit_lp)
             submit_chainlink_side = chainlink_signal(
                 active_window, start_chainlink_price, submit_cl)
@@ -1801,7 +1961,7 @@ async def run_bot():
                 submit_price_side, submit_book_side, submit_chainlink_side)
             if submit_price_side is None:
                 print(f"{_ts()} [RISK] No order: SIG PRICE is neutral immediately before submission.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
             # See the final-validation guard above: compare the AUTHORITY
             # side, not raw SIG PRICE, so this check means the same thing
@@ -1811,7 +1971,7 @@ async def run_bot():
                     f"{_ts()} [RISK] No order: deciding signal changed immediately "
                     f"before submission ({side} -> {submit_authority_side})."
                 )
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
             price_side = submit_price_side
             book_side = submit_book_side
@@ -1821,12 +1981,12 @@ async def run_bot():
             if (timer.window_start(action_wall) != active_window
                     or action_wall >= round_end - config.MIN_SECONDS_TO_EXPIRY):
                 print(f"{_ts()} [RISK] No order: round changed after final validation.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
             if not _execution_ready(mode, tokens["condition_id"]):
                 print(f"{_ts()} [RISK] No order: private fill stream lost "
                       "readiness before submission.")
-                await asyncio.sleep(0.2)
+                phase2_gate_until = _phase2_deadline(0.2)
                 continue
 
             # The cap was checked before the multi-signal legs ran, and each of
@@ -1841,7 +2001,7 @@ async def run_bot():
                     f"the multi-signal legs "
                     f"(${round_exposure:.2f}/${config.MAX_ROUND_EXPOSURE:.2f})."
                 )
-                await _cooldown()
+                phase2_gate_until = _phase2_deadline()
                 continue
 
             # entry_side can differ from side above - a hedge leg always
@@ -1864,12 +2024,33 @@ async def run_bot():
                         f"{_ts()} [RISK] No order this attempt: "
                         f"{entry_side} is not buyable - {exc}."
                     )
-                    await _cooldown()
+                    phase2_gate_until = _phase2_deadline()
                     continue
                 except Exception as exc:
                     print(f"{_ts()} [MARKET] Taper liquidity probe failed: "
                           f"{type(exc).__name__}: {exc}")
-                    await _cooldown(1.0)
+                    phase2_gate_until = _phase2_deadline(1.0)
+                    continue
+
+            # SIG BOOK for the pre-submit guard, read HERE - on the event
+            # loop's worker thread, off the broker's state lock. The guard
+            # itself runs while that lock is held and must not do network
+            # I/O; see _fresh_price_permit. Only a rule that actually reads
+            # BOOK pays for this read, so the default "price" rule is
+            # unchanged and costs nothing.
+            guard_book = None
+            if config.SIGNAL_DECISION_RULE != "price":
+                try:
+                    guard_book = _freeze_book(await asyncio.to_thread(
+                        orderbook.get_orderbook, ob_id))
+                except Exception as exc:
+                    guard_book = None
+                    print(f"{_ts()} [MARKET] SIG BOOK snapshot for the "
+                          f"pre-submit guard failed: {type(exc).__name__}: {exc}")
+                if guard_book is None:
+                    print(f"{_ts()} [RISK] No order: could not read a SIG BOOK "
+                          f"snapshot for the pre-submit guard.")
+                    phase2_gate_until = _phase2_deadline()
                     continue
 
             verb = "Simulating live-book FOK" if mode == "PAPER" else "Placing trade"
@@ -1882,10 +2063,11 @@ async def run_bot():
                 pre_submit_guard=lambda: _fresh_price_permit(
                     active_window, start_price, side, explain=True,
                     signal_observer=signal_epoch.observe,
-                    # Recompute SIG BOOK from its original reference token.
+                    # SIG BOOK stays oriented to its original reference token.
                     # The execution token can be DOWN; its depth is not the
                     # UP-oriented vote that selected this order.
                     book_token=ob_id,
+                    book_snapshot=guard_book,
                     chainlink_start=start_chainlink_price))
             if ok:
                 round_exposure += entry_ceiling
@@ -1948,7 +2130,7 @@ async def run_bot():
                 f"{_ts()} [BOT] Trade call done ({result}). Sleeping "
                 f"{config.TRADE_INTERVAL_SECONDS:g}s then continuing."
             )
-            await _cooldown()
+            phase2_gate_until = _phase2_deadline()
             continue
 
         await asyncio.sleep(0.2)

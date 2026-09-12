@@ -4,11 +4,32 @@ What is live, what is on the shelf, and what has been ruled out — with the
 numbers that decided each. Every variant here is switchable through `.env`;
 none of them require a code change.
 
-Last updated 2026-08-25.
+Last updated 2026-08-25. Profile inventory re-checked against `config.py`
+2026-09-12.
+
+**Nothing on this page is the shipped default.** Every profile below is an
+opt-in `.env` override. With no `.env` the bot runs phase 1 only, on the
+bands in `config.py` (and mirrored in `.env.example`):
+
+```
+PHASE1_ENABLED=1
+PHASE1_BANDS=300:240:0.35:0.45,240:180:0.30:0.40,180:120:0.40:0.50,120:60:0.55:0.75:8
+PHASE1_INTERVAL_SECONDS=12
+PHASE2_ENABLED=0            SIGNAL_DECISION_RULE=price
+BET_SIZE=2.50               MAX_BUY_PRICE=0.90    MIN_BUY_PRICE=0.20
+TRADE_LAST_SECONDS=120      TRADE_INTERVAL_SECONDS=6
+MIN_SECONDS_TO_EXPIRY=60    MAX_ROUND_EXPOSURE=(derived, $72.225)
+```
+
+To run any profile below, put its lines in `.env` and restart. To revert,
+delete them.
 
 ---
 
 ## Previous two-phase band profile (parked 2026-08-25)
+
+Note the bands here are the PARKED experiment's, not the shipped ones above.
+
 
 ```
 PHASE1_BANDS=300:270:0.40:0.60:15,270:240:0.30:0.50:15,240:210:0.50:0.60:15,210:180:0.40:0.50:15,180:150:0.55:0.65:15,150:120:0.50:0.60:15,120:60:0.40:0.50
@@ -38,7 +59,7 @@ phase-1 fills.
 
 ---
 
-## Active PAPER signal-follow mode
+## PAPER signal-follow mode (opt-in; NOT the default)
 
 ```
 PHASE1_ENABLED=0
@@ -51,7 +72,9 @@ PAPER_TRADE_LOG_PATH=signal_flip_v1_fills.csv
 BOT_TRADE_LOG_PATH=signal_flip_v1_decisions.csv
 ```
 
-This is a PAPER-only, no-band experiment. Phase 2 continues to enforce the
+Selecting this profile requires all of the lines above in `.env`: the
+switch fails configuration loading unless phase 1 is parked and phase 2 is
+enabled. It is a PAPER-only, no-band experiment. Phase 2 continues to enforce the
 global price floor/ceiling, FOK depth, spread, round exposure, readiness, and
 all initial/final/commit-time `SIG PRICE` checks. Same-side entries retain the
 normal cadence while only one outcome is held. Buying the other outcome needs

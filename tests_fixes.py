@@ -1521,6 +1521,18 @@ async def t_phase2_guard_uses_signal_book_for_down_orders():
               and changed["executor_guards"][0] is not True, str(changed))
 
 
+def _guard_book():
+    """A readable two-sided book snapshot for the pre-submit guard.
+
+    The guard runs under the broker's state lock and so never fetches a book
+    itself: the caller pre-fetches one off the lock and hands it in. These
+    tests stub orderbook.liquidity_signal, so only the SHAPE has to be a real
+    two-sided read - anything empty is now correctly refused as "no read"
+    rather than being recorded as a genuine abstention.
+    """
+    return (({"price": "0.49", "size": "10"},), ({"price": "0.51", "size": "10"},))
+
+
 def t_pre_submit_guard_explains_why_it_refused():
     """The console must say WHY, not just 'pre-submit guard rejected order'.
 
@@ -1563,7 +1575,7 @@ def t_pre_submit_guard_explains_why_it_refused():
             # pick (DOWN), which is exactly the "signal changed" scenario.
             allowed = main_bot._fresh_price_permit(
                 round_key, 100.0, "UP", book_token="tok",
-                chainlink_start=100.0)
+                book_snapshot=_guard_book(), chainlink_start=100.0)
         out = buf.getvalue()
         check("mismatched authority side is refused", allowed is False)
         check("the console explains it was a deciding-signal mismatch, "
@@ -1576,7 +1588,7 @@ def t_pre_submit_guard_explains_why_it_refused():
         with contextlib.redirect_stdout(buf2):
             allowed2 = main_bot._fresh_price_permit(
                 round_key, 100.0, "UP", book_token="tok",
-                chainlink_start=100.0)
+                book_snapshot=_guard_book(), chainlink_start=100.0)
         out2 = buf2.getvalue()
         check("a rolled-over round is refused", allowed2 is False)
         check("the console names the round rollover specifically",
@@ -2473,7 +2485,10 @@ def t_submission_path_revalidates_every_signal_and_latency():
     check("submission path samples fresh Chainlink data after blocking I/O",
           "submit_cl = current_chainlink_twap()" in source)
     check("submission path revalidates the book decision",
-          "final_book_side = orderbook.liquidity_signal" in source)
+          "final_book_side, final_book_state = _book_vote(" in source)
+    check("the submit gate never votes from an unread book",
+          "submit_book_side, submit_book_state = _book_vote(" in source
+          and "if submit_book_state in BOOK_NO_READ:" in source)
     check("submission path refuses a changed fresh price signal",
           "if submit_price_side != side:" in source)
     check("both phases perform an immediate price-side submission gate",

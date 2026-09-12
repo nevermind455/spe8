@@ -859,7 +859,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # charges the slot's real stake. It always charged BET_SIZE, which merely
     # over-charged until a taper ladder staked $5 per slot - then the round cap
     # under-counted by 19%.
-    "main_bot.py": "6443cc3e17b9aa588a53468b586165b3413829be303147b1fcd0c9e3fb1a2ef5",
+    "main_bot.py": "4a2195ab8d7e17a70421df54b0eb550e8e65fd702af1cf8d1655aeb443a82bb3",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
