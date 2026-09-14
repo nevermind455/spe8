@@ -341,6 +341,11 @@ def paper_report(base: pathlib.Path) -> int:
 
 
 # ====================================================================== LIVE
+def auth_window_marks(marks, first: float, last: float) -> bool:
+    """True when at least one balance read falls inside the trading window."""
+    return any(first <= m[0] <= last for m in marks)
+
+
 def live_report(base: pathlib.Path) -> int:
     """The same questions, answered from what LIVE actually records.
 
@@ -351,10 +356,11 @@ def live_report(base: pathlib.Path) -> int:
     levels arrives as several trades, so lots are regrouped by order id and
     each order is counted once.
 
-    Resolution does NOT redeem. A winning position is settled in the ledger
-    the moment the chain resolves, but its payout stays as outcome tokens
-    until someone redeems it on polymarket.com - so realized P&L here can run
-    well ahead of the wallet balance.
+    The ledger records what resolution PAID, not whether that money reached
+    the wallet. On a Polymarket proxy wallet winnings came back as cash during
+    the session and were re-spent, so they must not be reported as "owed".
+    Whether any is still claimable is a question for polymarket.com, not for
+    this file.
     """
     def path(env: str, default: str) -> pathlib.Path:
         name = os.environ.get(env) or default
@@ -432,8 +438,20 @@ def live_report(base: pathlib.Path) -> int:
                   f"credits from outside ${credits:+,.2f}")
             print("            (credits = redemptions + deposits - any fills "
                   "the ledger missed)")
-        print(f"            settled winnings owed ${winnings:,.2f} - only in "
-              f"the wallet once redeemed")
+        # Do NOT call this "owed". An earlier version did, and on a Polymarket
+        # proxy wallet the winnings had already come back as cash and been
+        # re-spent - the operator went to redeem $464.45 that did not exist.
+        # The ledger knows what resolution paid, not whether it reached the
+        # wallet, so the report says exactly that and no more.
+        print(f"            winners paid out ${winnings:,.2f} over the session "
+              f"(against ${turnover:,.2f} bought)")
+        print("            If Portfolio shows nothing to claim, that money already "
+              "came back and was re-spent.")
+        if len(marks) >= 1 and winnings and not auth_window_marks(marks, first, last):
+            print(f"            No balance reads during trading, so the starting "
+                  f"wallet is unknown; if every")
+            print(f"            winner was redeemed it was about "
+                  f"${b1 - realized:,.2f} (last read minus realized P&L).")
 
     # --------------------------------------------------------- integrity --
     counters = {k: led.get(k) for k in (
