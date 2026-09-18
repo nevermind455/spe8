@@ -1688,13 +1688,17 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # config.py are byte-identical.
     "main_bot.py": "4a2195ab8d7e17a70421df54b0eb550e8e65fd702af1cf8d1655aeb443a82bb3",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
-    "polymarket_trade.py": "fe52eedbbda0030cc2e1f7fa3fb9d0c6effe72caa0c3ee851e60ff95281d6bef",
+    # config.py, polymarket_trade.py re-approved 2026-09-16: paper fill-delay
+    # probes (PAPER_FILL_DELAY_PROBES) and live POST timing. Both diagnostic:
+    # nothing reads them for a decision. Paper had assumed instant matching
+    # and live won 10.5 points less often at the same prices.
+    "polymarket_trade.py": "4e588de79852420c02ff0d7658b8cd393bc0cc381ab844a0382339d8bdfcf8ae",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
     "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "1a96307493a98550dd9fcdb029c6cf908d846d54b3c80fa9b70d3ff59c83aa4f",
+    "config.py": "5e08ae215fd0d7e8b2d2888891ccb129adde21521cfcb0228d118bebcb046d79",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

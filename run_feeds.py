@@ -682,6 +682,9 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
             min_seconds_to_expiry=config.MIN_SECONDS_TO_EXPIRY,
             # Must span every enabled phase, not just phase 2's window.
             trade_window_seconds=config.EXECUTION_WINDOW_SECONDS,
+            # Diagnostic book re-reads after each fill; empty by default. See
+            # config.PAPER_FILL_DELAY_PROBES.
+            fill_delay_probes=config.PAPER_FILL_DELAY_PROBES,
             book_fetch=lambda token: fetch_executable_book(
                 token, host=config.CLOB_HOST, ws_view=hub.book.view(str(token))),
             on_event=on_event,

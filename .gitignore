@@ -86,6 +86,9 @@ _sig.json
 multi_*.json
 multi_*.csv
 multi_*.jsonl
+# Fill-timing diagnostics: order ids and timing from paper and live runs.
+*_fill_delay.jsonl
+live_fill_timing.jsonl
 live_ledger.json
 signal_journal*.csv
 signal_journal*.json

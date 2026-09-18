@@ -161,6 +161,49 @@ HTTP_KEEPALIVE_IDLE_SECONDS = _env_int("HTTP_KEEPALIVE_IDLE_SECONDS", "30")
 HTTP_KEEPALIVE_INTERVAL_SECONDS = _env_int("HTTP_KEEPALIVE_INTERVAL_SECONDS", "10")
 CLOCK_MAX_DRIFT_SECONDS = _env_float("CLOCK_MAX_DRIFT_SECONDS", "2.0")
 PAPER_LATENCY_MS = _env_float("PAPER_LATENCY_MS", "150")
+
+
+def _delay_probes(name: str) -> tuple[float, ...]:
+    """Seconds-after-decision offsets for PAPER fill-delay probes, e.g. "1,3,5"."""
+    raw = (_env_text(name, "") or "").strip()
+    if not raw:
+        return ()
+    out = []
+    for piece in raw.replace(";", ",").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            value = float(piece)
+        except ValueError:
+            raise ValueError(
+                f"{name} entries must be numbers of seconds, got {piece!r}")
+        if not math.isfinite(value) or not 0 < value <= 60:
+            raise ValueError(f"{name} entries must be between 0 and 60 seconds")
+        out.append(value)
+    if len(out) > 6:
+        raise ValueError(f"{name} allows at most 6 probes")
+    return tuple(sorted(set(out)))
+
+
+# Fill-delay probes: after each PAPER fill, re-quote the same order against
+# the book this many seconds after the decision, and record what it would
+# have cost - or that it would not have filled. Empty disables it.
+#
+# Why. Every archived paper fill matched after exactly PAPER_LATENCY_MS: the
+# venue publishes seconds_delay=0 while flagging itode=true (a taker matching
+# delay exists but is never stated), and paper trusts the 0. Live then won
+# 10.5 points less often than paper at the same prices (p=0.007), and live's
+# unfilled attempts pointed at the eventual winner 11.1 points more often than
+# its filled ones. Nothing measured the real submit-to-match time, so no
+# latency setting could be chosen from evidence. These rows show how paper's
+# edge decays as fills get slower, so paper can be calibrated to live instead
+# of trusted.
+#
+# Diagnostic only: a probe places nothing, never touches cash or the ledger,
+# and any failure is swallowed. The journal sits beside the paper audit file
+# as <audit stem>_fill_delay.jsonl.
+PAPER_FILL_DELAY_PROBES = _delay_probes("PAPER_FILL_DELAY_PROBES")
 TWAP_STALE_AFTER = _env_float("TWAP_STALE_AFTER", "10.0")
 # No order inside the final minute. Measured over 16 fills: 31.2% won against
 # a 69.6% break-even, z = -3.29 - and it has a mechanism, not just a p-value.

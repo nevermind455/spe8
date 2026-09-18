@@ -179,6 +179,137 @@ def pairs_section(held: dict) -> None:
           f"   ({matched:,.0f} matched sh, {skew:,.0f} skew sh)")
 
 
+def fill_delay_section(journal: pathlib.Path, pos: dict) -> None:
+    """How paper's edge changes when the same fills happen later.
+
+    Reads rows written by PaperBroker's fill-delay probes. Each order's first
+    row is the fill paper actually made; later rows re-quote the same FOK
+    against the book seconds afterwards. An order that no longer fills at a
+    delay is one a slower live order would likely have missed, and "missed
+    won" says whether those misses were winners.
+    """
+    if not journal.is_file():
+        return
+    rows = []
+    for line in journal.read_text(encoding="utf-8").splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    paid = {r.get("order_id"): r.get("average_price") for r in rows
+            if r.get("reason") == "actual paper fill"}
+    probes = [r for r in rows if r.get("reason") != "actual paper fill"]
+    delays = {float(r.get("delay_s") or 0.0) for r in probes}
+    # Compare the same orders at every delay. A probe that measured nothing
+    # (round already closed, book unreadable, bot stopped first) removes its
+    # order from every row - otherwise the longer delays would silently drop
+    # late-round fills the paper row keeps, and the rows would compare
+    # different trades.
+    measured = collections.defaultdict(set)
+    for r in probes:
+        if r.get("fillable") is not None:
+            measured[r.get("order_id")].add(float(r.get("delay_s") or 0.0))
+    complete = {oid for oid in paid if delays and measured.get(oid) == delays}
+    PAPER = -1.0   # sort key for the fill paper actually made
+    groups = (("all fills", lambda px: True),
+              ("0.70-0.80", lambda px: 0.70 <= px < 0.80))
+    for title, keep in groups:
+        stats = collections.defaultdict(lambda: {
+            "orders": 0, "fill": 0, "won": 0, "px": 0.0,
+            "miss": 0, "miss_won": 0})
+        dropped = set()
+        for r in rows:
+            oid = r.get("order_id")
+            base_px = paid.get(oid)
+            if base_px is None or not keep(base_px):
+                continue
+            q = pos.get(str(r.get("token_id")))
+            if not q or not q.get("settled"):
+                continue
+            if oid not in complete:
+                dropped.add(oid)
+                continue
+            won = (q.get("payout_per_share") or 0.0) > 0.9
+            key = (PAPER if r.get("reason") == "actual paper fill"
+                   else float(r.get("delay_s") or 0.0))
+            s = stats[key]
+            s["orders"] += 1
+            if r["fillable"]:
+                s["fill"] += 1
+                s["won"] += won
+                s["px"] += float(r.get("average_price") or 0.0)
+            else:
+                s["miss"] += 1
+                s["miss_won"] += won
+        if not any(s["orders"] for s in stats.values()):
+            if dropped:
+                print(f"\nFILL DELAY  {title}: {len(dropped)} settled orders, none "
+                      f"measured at every delay yet")
+            continue
+        print(f"\nFILL DELAY  {title}  (same settled orders at every delay; "
+              f"seconds after the decision)")
+        if dropped:
+            print(f"            {len(dropped)} excluded: a probe measured nothing "
+                  f"(round closed, book unreadable, or bot stopped first)")
+        print(f"{'delay':>7}{'orders':>8}{'fill':>6}{'won':>8}{'avg px':>8}"
+              f"{'EDGE':>8}{'z / p':>15}{'missed':>8}{'missed won':>12}")
+        for delay in sorted(stats):
+            s = stats[delay]
+            label = "  paper" if delay == PAPER else f"{delay:>6.2f}s"
+            if not s["orders"]:
+                continue
+            if s["fill"]:
+                win = s["won"] / s["fill"]
+                px = s["px"] / s["fill"]
+                middle = (f"{win * 100:>7.1f}%{px:>8.3f}{win - px:>+8.3f}"
+                          f"  {sig(s['fill'], win, px):<13}")
+            else:
+                middle = f"{'--':>8}{'--':>8}{'--':>8}{'':>15}"
+            missed = (f"{s['miss_won'] / s['miss'] * 100:>11.1f}%"
+                      if s["miss"] else f"{'--':>12}")
+            print(f"{label}{s['orders']:>8}{s['fill']:>6}{middle}"
+                  f"{s['miss']:>8}{missed}")
+        print("   If EDGE falls as delay grows, paper's edge depends on filling")
+        print("   faster than live can. 'missed won' above 'won' means the slower")
+        print("   fills lose the winners - the adverse selection live showed.")
+
+
+def live_timing_section(path: pathlib.Path, orders: dict) -> None:
+    """Real POST -> venue response -> fill confirmation times, per order."""
+    if not path.is_file():
+        return
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    posts = sorted(float(r["post_seconds"]) for r in rows
+                   if isinstance(r.get("post_seconds"), (int, float)))
+    confirm = sorted(
+        orders[r["order_id"]]["wall"] - float(r["submitted_wall"])
+        for r in rows
+        if r.get("order_id") in orders
+        and isinstance(r.get("submitted_wall"), (int, float)))
+    if not posts and not confirm:
+        return
+
+    def q(xs, p):
+        return xs[min(len(xs) - 1, int(len(xs) * p))]
+
+    print(f"\nTIMING      {len(rows)} live POSTs recorded")
+    if posts:
+        print(f"            POST -> venue response  median "
+              f"{statistics.median(posts):.3f}s   p90 {q(posts, 0.9):.3f}s")
+    if confirm:
+        print(f"            POST -> fill confirmed  median "
+              f"{statistics.median(confirm):.3f}s   p90 {q(confirm, 0.9):.3f}s"
+              f"   ({len(confirm)} fills)")
+    print("            The response time is the closer measure of matching; the")
+    print("            confirmation also waits for the trade to settle on chain.")
+    print("            Calibrate PAPER_LATENCY_MS and the fill-delay probes to it.")
+
+
 # ===================================================================== PAPER
 def paper_report(base: pathlib.Path) -> int:
     p = resolve(base)
@@ -334,6 +465,8 @@ def paper_report(base: pathlib.Path) -> int:
             print("   not whether the position won - a hedge leg buys the")
             print("   complement of the pick on purpose.")
 
+    fill_delay_section(
+        p["audit"].with_name(f"{p['audit'].stem}_fill_delay.jsonl"), pos)
     settlement_section(pos)
     if open_pos:
         print(f"\nOPEN        {len(open_pos)} unsettled, ${frozen:,.2f} frozen")
@@ -526,6 +659,8 @@ def live_report(base: pathlib.Path) -> int:
               f"   {sig(total['n'], win, avg_px)}")
     print_bands(bands)
     pairs_section(held)
+    live_timing_section(
+        path("LIVE_FILL_TIMING_PATH", "live_fill_timing.jsonl"), orders)
     settlement_section(pos)
     return 0
 

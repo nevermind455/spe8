@@ -968,6 +968,145 @@ def t_paper_dashboard_renders_exact_geometry():
     check("paper dashboard exposes PnL", "TOTAL PNL" in full_text, full_text)
 
 
+def t_fill_delay_probes_record_later_quotes_without_touching_cash():
+    """Probes re-quote the same order later and change nothing about the fill.
+
+    Paper matched every archived order after exactly PAPER_LATENCY_MS while
+    live won 10.5 points less often at the same prices. The probes measure how
+    that gap opens with delay, and they are only trustworthy if they are pure
+    observation - so this pins that they never alter cash or the ledger.
+    """
+    import paper_trade as paper
+
+    scheduled = []
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp)
+        broker.fill_delay_probes = (1.0, 3.0)
+        broker._schedule_probe = lambda wait, fn: scheduled.append((wait, fn))
+        check("a probed order still fills", paper_order(broker))
+        cash_after_fill = broker.cash_balance()
+        seen_after_fill = len(broker.ledger.seen)
+        check("one probe is scheduled per configured delay",
+              [round(w, 3) for w, _ in scheduled] == [1.0, 3.0], str(scheduled))
+        if len(scheduled) == 2:
+            scheduled[0][1]()                    # 1s later: same book, fills
+            original = paper.estimate_fok
+            paper.estimate_fok = lambda *a, **k: (_ for _ in ()).throw(
+                paper.PaperRejected("FOK no-fill: price moved past the cap"))
+            try:
+                scheduled[1][1]()                # 3s later: the price has run
+            finally:
+                paper.estimate_fok = original
+
+        journal = pathlib.Path(tmp) / "paper_orders_fill_delay.jsonl"
+        rows = ([json.loads(line) for line in journal.read_text().splitlines()]
+                if journal.exists() else [])
+        by_delay = {r["delay_s"]: r for r in rows
+                    if r.get("reason") != "actual paper fill"}
+        check("the actual fill is recorded as the baseline row",
+              sum(r.get("reason") == "actual paper fill" for r in rows) == 1
+              and rows[0].get("fillable") is True, str(rows))
+        check("a later book that still fills is recorded as fillable",
+              by_delay.get(1.0, {}).get("fillable") is True
+              and bool(by_delay.get(1.0, {}).get("average_price")), str(rows))
+        check("a later book that would miss is a no-fill, not an error",
+              by_delay.get(3.0, {}).get("fillable") is False
+              and "no-fill" in by_delay.get(3.0, {}).get("reason", ""), str(rows))
+        check("probes never move cash",
+              approx(broker.cash_balance(), cash_after_fill),
+              f"{broker.cash_balance()} vs {cash_after_fill}")
+        check("probes never write to the ledger",
+              len(broker.ledger.seen) == seen_after_fill, str(broker.ledger.seen))
+
+
+def t_fill_delay_probe_failures_never_reach_the_fill_path():
+    """A broken probe must not stop the bot.
+
+    place_trade treats an unexpected exception as fatal and re-raises it, so
+    a scheduler or book-read failure escaping the probe code would halt
+    trading over a diagnostic.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp)
+        broker.fill_delay_probes = (2.0,)
+
+        def exploding_scheduler(_wait, _fn):
+            raise RuntimeError("timer thread unavailable")
+
+        broker._schedule_probe = exploding_scheduler
+        check("a failing scheduler still lets the fill complete",
+              paper_order(broker) is True, str(broker.last_error))
+
+        captured = []
+        broker._schedule_probe = lambda _wait, fn: captured.append(fn)
+        paper_order(broker)
+        check("the next fill schedules its probe", bool(captured), str(captured))
+        raised = None
+        if captured:
+            broker._book_fetch = lambda _token: (_ for _ in ()).throw(
+                TimeoutError("book read timed out"))
+            try:
+                captured[0]()
+            except Exception as exc:
+                raised = exc
+        check("a probe whose book read fails does not raise", raised is None,
+              repr(raised))
+        journal = pathlib.Path(tmp) / "paper_orders_fill_delay.jsonl"
+        rows = ([json.loads(line) for line in journal.read_text().splitlines()]
+                if journal.exists() else [])
+        errored = [r for r in rows if r.get("fillable") is None]
+        check("a failed probe is recorded as an error, kept out of statistics",
+              bool(errored) and "probe error" in errored[-1].get("reason", ""),
+              str(rows))
+
+
+def t_fill_delay_probes_are_off_by_default():
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _broker(tmp)
+        check("no probes are configured by default", broker.fill_delay_probes == ())
+        paper_order(broker)
+        check("and no delay journal is written",
+              not (pathlib.Path(tmp) / "paper_orders_fill_delay.jsonl").exists())
+
+
+def t_live_fill_timing_journal_records_post_and_response():
+    """Live must record when an order was POSTed and when the venue answered.
+
+    Receipts carried no timestamps, so the real submit-to-match time - the
+    number that decides whether paper can predict live - was never measured.
+    """
+    import os
+    import polymarket_trade as trade
+
+    rows = []
+    swallowed = False
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp) / "timing.jsonl"
+        saved = os.environ.get("LIVE_FILL_TIMING_PATH")
+        os.environ["LIVE_FILL_TIMING_PATH"] = str(target)
+        try:
+            trade._record_fill_timing("oid-1", "matched", None, 100.0, 100.25,
+                                      token_id="up", condition_id="cond")
+            rows = [json.loads(line) for line in target.read_text().splitlines()]
+            # A directory is not appendable: the write must fail quietly.
+            os.environ["LIVE_FILL_TIMING_PATH"] = tmp
+            trade._record_fill_timing("oid-2", "matched", None, 1.0, 2.0,
+                                      token_id="up", condition_id="cond")
+            swallowed = True
+        except Exception:
+            swallowed = False
+        finally:
+            if saved is None:
+                os.environ.pop("LIVE_FILL_TIMING_PATH", None)
+            else:
+                os.environ["LIVE_FILL_TIMING_PATH"] = saved
+    check("a POST is recorded with both timestamps",
+          bool(rows) and rows[0]["order_id"] == "oid-1"
+          and rows[0]["submitted_wall"] == 100.0
+          and abs(rows[0]["post_seconds"] - 0.25) < 1e-9, str(rows))
+    check("an unwritable journal never raises into the order path", swallowed)
+
+
 def main() -> int:
     for name, test in sorted(globals().items()):
         if not name.startswith("t_") or not callable(test):

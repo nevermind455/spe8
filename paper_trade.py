@@ -584,6 +584,13 @@ def estimate_fok(book: BookSnapshot, amount, max_price,
                      total_fee, tuple(used))
 
 
+def _start_daemon_timer(delay_s: float, fn: Callable[[], None]) -> None:
+    """Run ``fn`` once after ``delay_s`` seconds on a daemon thread."""
+    handle = threading.Timer(max(0.0, float(delay_s)), fn)
+    handle.daemon = True
+    handle.start()
+
+
 class PaperBroker:
     """Persistent paper cash, fills and venue-resolution PnL."""
 
@@ -611,6 +618,8 @@ class PaperBroker:
         min_seconds_to_expiry: float = 1.0,
         trade_window_seconds: float = 60.0,
         on_event=None,
+        fill_delay_probes: tuple = (),
+        probe_scheduler: Callable[[float, Callable[[], None]], None] | None = None,
     ) -> None:
         self.ledger = ledger
         self.market_context = market_context
@@ -633,10 +642,22 @@ class PaperBroker:
                 or not self.min_seconds_to_expiry < self.trade_window_seconds <= 300
                 or not 0 <= self.min_buy_price < self.max_buy_price < 1):
             raise ValueError("invalid paper latency/book-age/spread configuration")
+        self.fill_delay_probes = tuple(float(d) for d in (fill_delay_probes or ()))
+        if any(not math.isfinite(d) or not 0 < d <= 60 for d in self.fill_delay_probes):
+            raise ValueError("fill delay probes must be between 0 and 60 seconds")
         self.on_event = on_event
         base = Path(ledger.path).resolve().parent
         self.account_path = Path(account_path or base / "paper_account.json")
         self.audit_path = Path(audit_path or base / "paper_orders.jsonl")
+        # Diagnostic journal for fill-delay probes. Named from the audit file
+        # so each paper profile keeps its own, and deliberately NOT part of the
+        # state set below: it holds no cash or positions and may be deleted.
+        self.delay_journal_path = self.audit_path.with_name(
+            f"{self.audit_path.stem}_fill_delay.jsonl")
+        # Probes run on their own timers, never on the trading thread - a
+        # 5-second probe inline would stall the loop 5 seconds per fill.
+        self._schedule_probe = probe_scheduler or _start_daemon_timer
+        self._probe_lock = threading.Lock()
         state_paths = {
             Path(self.ledger.path).resolve(), self.account_path.resolve(),
             self.audit_path.resolve(),
@@ -1155,6 +1176,11 @@ class PaperBroker:
                 }
                 self._audit(self.last_fill)
             self._publish_error(None)
+            self._schedule_fill_delay_probes(
+                order_id=order_id, token_id=str(token_id),
+                condition_id=condition_id, side=side, spend=spend, cap=cap,
+                floor=floor, rules=rules, fill=quote,
+                latency_s=assumed_latency_ms / 1000.0, window_end=end)
             print(
                 f"[PAPER] FOK filled: {side} ${float(quote.notional):.2f} | "
                 f"{float(quote.shares):.6f} shares @ {float(quote.average_price):.6f} | "
@@ -1173,6 +1199,97 @@ class PaperBroker:
             self._publish_error(self.last_error)
             print(f"[PAPER] FATAL: {self.last_error}")
             raise
+
+    def _schedule_fill_delay_probes(self, *, order_id, token_id, condition_id,
+                                    side, spend, cap, floor, rules, fill,
+                                    latency_s, window_end) -> None:
+        """Record what this same order would have cost after a longer delay.
+
+        Paper matches as soon as its modelled latency elapses. Live waits for
+        the network and for the venue's own taker matching delay, which the
+        venue flags (itode) but never quantifies. Every archived paper fill
+        used exactly PAPER_LATENCY_MS, and live then won 10.5 points less often
+        at the same prices - so re-quoting at later offsets shows how much of
+        paper's edge depends on filling faster than live can.
+
+        Diagnostic only, and fenced accordingly: nothing here places an order
+        or touches cash or the ledger, and every error is swallowed. An
+        exception escaping into place_trade would reach its fatal handler and
+        stop the bot over a measurement.
+        """
+        if not self.fill_delay_probes:
+            return
+        try:
+            base = {
+                "order_id": order_id, "token_id": token_id,
+                "condition_id": condition_id, "side": side,
+                "stake": float(spend), "cap": float(cap), "floor": float(floor),
+                "fill_wall": time.time(), "window_end": float(window_end),
+            }
+            self._write_delay_row({
+                **base, "delay_s": round(float(latency_s), 3), "fillable": True,
+                "average_price": float(fill.average_price),
+                "total_cost": float(fill.total_cost),
+                "reason": "actual paper fill",
+            })
+            for delay_s in self.fill_delay_probes:
+                if delay_s <= latency_s:
+                    continue
+                self._schedule_probe(
+                    delay_s - latency_s,
+                    lambda d=delay_s: self._run_delay_probe(
+                        base, d, spend, cap, floor, rules))
+        except Exception:
+            pass
+
+    def _run_delay_probe(self, base, delay_s, spend, cap, floor, rules) -> None:
+        """Quote the same FOK against the book as it stands now."""
+        try:
+            row = {**base, "delay_s": round(float(delay_s), 3),
+                   "probed_wall": time.time(), "average_price": None,
+                   "total_cost": None}
+            # fillable=None marks a probe that measured nothing. It is kept
+            # out of the statistics rather than miscounted as a miss.
+            if timer.unix() >= base["window_end"] - self.min_seconds_to_expiry:
+                # Live could not have filled here either, and the book of a
+                # closed round is empty - that is not evidence of a miss.
+                row.update(fillable=None, reason="round closed before probe")
+                self._write_delay_row(row)
+                return
+            try:
+                book = self._book_fetch(base["token_id"])
+            except Exception as exc:
+                # A stale or unreadable book says nothing about the price.
+                row.update(fillable=None,
+                           reason=f"probe error: {type(exc).__name__}: {str(exc)[:120]}")
+                self._write_delay_row(row)
+                return
+            row["book_timestamp"] = getattr(book, "timestamp", None)
+            try:
+                quote = estimate_fok(book, spend, cap, rules, min_price=floor)
+                row.update(fillable=True,
+                           average_price=float(quote.average_price),
+                           total_cost=float(quote.total_cost), reason="")
+            except PaperRejected as exc:
+                # A genuine no-fill: at this delay the order would have missed.
+                row.update(fillable=False, reason=str(exc)[:160])
+            except Exception as exc:
+                row.update(fillable=None,
+                           reason=f"probe error: {type(exc).__name__}")
+            self._write_delay_row(row)
+        except Exception:
+            pass
+
+    def _write_delay_row(self, row: dict) -> None:
+        # Appended without fsync: this is a diagnostic, and on a one-vCPU host
+        # a synced write per probe would compete with the trading loop for IO.
+        try:
+            with self._probe_lock:
+                self.delay_journal_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.delay_journal_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+        except Exception:
+            pass
 
     def _reject(self, side, amount, reason: str) -> bool:
         reason = reason or "paper order rejected"

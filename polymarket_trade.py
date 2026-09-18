@@ -651,6 +651,44 @@ def _ambiguous_blocks(condition_id: str, token_id: str) -> bool:
     return str(token_id) in _ambiguous_tokens
 
 
+def _record_fill_timing(order_id, status, error, submitted_wall, responded_wall,
+                        *, token_id, condition_id) -> None:
+    """Append when a live order was POSTed and when the venue answered.
+
+    Live receipts carried no timestamps at all, so the one number that decides
+    whether paper can predict live - how long a real order takes to match -
+    had never been measured. Paper assumes the venue matches as soon as
+    PAPER_LATENCY_MS elapses. These rows, joined by order id to the confirmed
+    lots in the ledger, give the real submit -> response -> confirm timeline.
+
+    Diagnostic only: written outside the accounting journal, never read by any
+    decision, and every failure is swallowed. Test runs write nothing unless
+    LIVE_FILL_TIMING_PATH is set, so fixtures never masquerade as venue data.
+    """
+    try:
+        import json as _json
+        target = os.environ.get("LIVE_FILL_TIMING_PATH")
+        if not target:
+            if pathlib.Path(sys.argv[0]).name.startswith("tests_"):
+                return
+            target = str(pathlib.Path(__file__).resolve().parent
+                         / "live_fill_timing.jsonl")
+        row = {
+            "order_id": order_id,
+            "status": None if status is None else str(status),
+            "error": _safe_error(error)[:160] if error else None,
+            "token_id": str(token_id),
+            "condition_id": str(condition_id),
+            "submitted_wall": float(submitted_wall),
+            "responded_wall": float(responded_wall),
+            "post_seconds": float(responded_wall) - float(submitted_wall),
+        }
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row, sort_keys=True, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def _journal_receipt(receipt: dict) -> bool:
     with _state_lock:
         callback = _order_observer
@@ -945,10 +983,14 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             last_order_error = guard_error
             print(f"[LIVE] Order blocked before submission: {last_order_error}")
             return False
+        submitted_wall = time.time()
         try:
             resp = client.post_order(signed, OrderType.FOK)
         except Exception as exc:
             err = _safe_error(exc)
+            _record_fill_timing(None, "post_raised", err, submitted_wall,
+                                time.time(), token_id=token_id,
+                                condition_id=condition_id)
             if _is_no_match(err) and attempt < 2:
                 time.sleep(0.5)
                 continue
@@ -959,7 +1001,10 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             print(f"[LIVE] Place order error: {last_order_error}")
             return False
 
+        responded_wall = time.time()
         oid, status, err = _accepted_order_response(resp)
+        _record_fill_timing(oid, status, err, submitted_wall, responded_wall,
+                            token_id=token_id, condition_id=condition_id)
         if err is not None:
             err = _safe_error(err)
             if _is_no_match(err) and attempt < 2:
