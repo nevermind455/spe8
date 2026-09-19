@@ -871,7 +871,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "5e08ae215fd0d7e8b2d2888891ccb129adde21521cfcb0228d118bebcb046d79",
+    "config.py": "bbf558ea39d67f4879bbf576d07f77d2160f66fd3ff0a3102a8fc1d562d598e8",
 }
 
 

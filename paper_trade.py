@@ -1208,9 +1208,10 @@ class PaperBroker:
         Paper matches as soon as its modelled latency elapses. Live waits for
         the network and for the venue's own taker matching delay, which the
         venue flags (itode) but never quantifies. Every archived paper fill
-        used exactly PAPER_LATENCY_MS, and live then won 10.5 points less often
-        at the same prices - so re-quoting at later offsets shows how much of
-        paper's edge depends on filling faster than live can.
+        used exactly PAPER_LATENCY_MS, so re-quoting the same order at later
+        offsets is the only way to see how much of paper's edge depends on
+        filling faster than live can - and gate2.py puts that edge at about a
+        tick, which a slower fill erases.
 
         Diagnostic only, and fenced accordingly: nothing here places an order
         or touches cash or the ledger, and every error is swallowed. An

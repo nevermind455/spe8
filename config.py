@@ -192,12 +192,15 @@ def _delay_probes(name: str) -> tuple[float, ...]:
 #
 # Why. Every archived paper fill matched after exactly PAPER_LATENCY_MS: the
 # venue publishes seconds_delay=0 while flagging itode=true (a taker matching
-# delay exists but is never stated), and paper trusts the 0. Live then won
-# 10.5 points less often than paper at the same prices (p=0.007), and live's
-# unfilled attempts pointed at the eventual winner 11.1 points more often than
-# its filled ones. Nothing measured the real submit-to-match time, so no
-# latency setting could be chosen from evidence. These rows show how paper's
-# edge decays as fills get slower, so paper can be calibrated to live instead
+# delay exists but is never stated), and paper trusts the 0. Nothing has ever
+# measured the real submit-to-match time, so no latency setting can be chosen
+# from evidence - which is the whole problem, because gate2.py shows paper's
+# edge is worth roughly a tick: hold the band choice out of sample and the
+# record is -0.017 edge, -4.7% return over 521 orders, and assuming the
+# orders that miss are the winners takes it to -17%. A model that only works
+# when it fills instantly is not a model of this venue.
+#
+# These rows measure the decay directly, so paper can be calibrated instead
 # of trusted.
 #
 # Diagnostic only: a probe places nothing, never touches cash or the ledger,
