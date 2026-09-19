@@ -178,5 +178,11 @@ a variant scoring well on the archive alone is not evidence.
 at every sample regardless of trading, so future variants can be tested on an
 unbiased sample instead of on the shadow of past decisions.
 
+It still collapses each book to four numbers - best bid, best ask, and the
+total size on each side - which is enough to ask "was the top of book cheap"
+and not enough to ask "would this have filled". `book_recorder.py` records
+the ladder itself and `book_backtest.py` walks it; see `GATE1.md`. A band
+that scores well in this file and cannot fill in that one does not work.
+
 To activate any variant, put its `PHASE1_BANDS` line in `.env` and restart.
 To revert, delete the line.

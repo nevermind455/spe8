@@ -63,6 +63,7 @@ python tests_paper.py
 python tests_accounting.py
 python tests_feeds.py
 python tests_dashboard.py
+python tests_book_backtest.py
 python run_terminal.py --selftest
 ```
 
@@ -80,5 +81,21 @@ Do not use live mode until the credentialed canary checks listed in
 the pinned V2 SDK currently has an open upstream type-3/POLY_1271 API-key
 derivation issue, so this build rejects `POLY_SIGNATURE_TYPE=3` at startup.
 
-See `PAPER_MODE.md`, `FEEDS.md`, `ACCOUNTING.md`, and `DEEP_AUDIT.md` for the
-execution model, persistence files, safeguards, findings, and remaining risks.
+## Before you trust a strategy
+
+A backtest against one price per candle is not a backtest - your fill comes
+off the ladder, not off a close. `book_recorder.py` records the real book,
+full depth on both sides, every tick, and `book_backtest.py` replays against
+it. Start recording before you need the history; nobody sells it.
+
+```bash
+python book_recorder.py record        # leave running
+python book_recorder.py resolve       # who actually won each round
+python book_backtest.py               # BOOK vs QUOTE, side by side
+```
+
+`GATE1.md` explains what the two engines do and how to read the verdict.
+
+See `PAPER_MODE.md`, `FEEDS.md`, `ACCOUNTING.md`, `GATE1.md`, and
+`DEEP_AUDIT.md` for the execution model, persistence files, safeguards,
+findings, and remaining risks.

@@ -46,6 +46,8 @@ signal_flip_v1_*
 *_fills.csv
 signal_journal.csv
 signal_journal_winners.json
+book_tape.jsonl
+book_tape_winners.json
 
 # Archived runs of the state files above.
 archive/
@@ -92,3 +94,5 @@ live_fill_timing.jsonl
 live_ledger.json
 signal_journal*.csv
 signal_journal*.json
+book_tape*.jsonl
+book_tape*.json
