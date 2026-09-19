@@ -92,6 +92,7 @@ it. Start recording before you need the history; nobody sells it.
 python book_recorder.py record        # leave running
 python book_recorder.py resolve       # who actually won each round
 python book_backtest.py               # BOOK vs QUOTE, side by side
+python band_tuner.py --sweep          # rank bands, with the noise floor shown
 ```
 
 `GATE1.md` explains what the two engines do and how to read the verdict.

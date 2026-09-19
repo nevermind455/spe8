@@ -361,5 +361,164 @@ def main() -> int:
     return 1 if F else 0
 
 
+
+# --------------------------------------------------- 6 TUNER (band_tuner.py) ---
+def _tape(rounds, *, edge=0.5, seed=0, price=None, top=60.0, thin=False):
+    """Synthetic rounds. `edge` is how often the signal names the winner.
+
+    Prices vary round to round unless `price` pins them, so a sweep over many
+    cells really has many cells with fills in them - a tape where only one
+    cell can ever fill is not a search, and would understate the noise floor.
+    Both legs' asks sum to 1.01, as the real venue's do.
+    """
+    import random
+    rng = random.Random(seed)
+    by_window, wins = {}, {}
+    for i in range(rounds):
+        w = WINDOW + i * 300
+        drift = rng.gauss(0, 0.5)
+        truth = "UP" if drift >= 0 else "DOWN"
+        wins[str(w)] = truth if rng.random() < edge else (
+            "DOWN" if truth == "UP" else "UP")
+        up = price if price is not None else round(rng.uniform(0.28, 0.70), 2)
+        dn = round(1.01 - up, 2)
+
+        def lad(first):
+            # `thin` leaves one level under the venue minimum and nothing
+            # behind it, which is a refusal rather than a small fill.
+            if thin:
+                return [(first, top)]
+            return [(first, top), (round(first + 0.05, 2), 300)]
+
+        snaps = []
+        for left in (250, 200, 150):
+            s = snap(left, lad(up), window=w, cl_strike=100.0,
+                     cl_now=100.0 + drift)
+            s["down"] = book(lad(dn), other=[(0.20, 100)])
+            snaps.append(s)
+        by_window[w] = snaps
+    return by_window, wins
+
+
+def t_tuner_takes_one_entry_per_round():
+    import band_tuner as bt
+    by_window, wins = _tape(6, seed=1)
+    fills, misses = bt.entries_for((300, 60, 0.30, 0.50), by_window,
+                                   stake=2.50, signal="chainlink", theta=0.07,
+                                   min_shares=5.0, cap=0.90)
+    check("one fill per round, not one per snapshot",
+          len(fills) <= 6 and len({f["window"] for f in fills}) == len(fills),
+          f"{len(fills)} fills over 6 rounds")
+    check("no phantom misses when depth is deep", misses == 0)
+
+
+def t_tuner_counts_a_thin_round_as_a_miss_not_a_win():
+    import band_tuner as bt
+    by_window, wins = _tape(4, seed=2, price=0.40, top=1.0, thin=True)
+    fills, misses = bt.entries_for((300, 60, 0.30, 0.50), by_window,
+                                   stake=2.50, signal="chainlink", theta=0.07,
+                                   min_shares=5.0, cap=0.90)
+    # Only rounds whose signal picked the leg priced inside the band are
+    # entries at all; the rest never wanted the trade and are not misses.
+    wanted = sum(1 for snaps in by_window.values()
+                 if bb.side_for(snaps[0], "chainlink") == "UP")
+    check("a round that could not fill produces no fill", not fills)
+    check("every round the band wanted is counted as a miss",
+          misses == wanted and misses > 0, f"{misses} misses vs {wanted} wanted")
+
+
+def t_tuner_clusters_by_round():
+    """Two fills in one round are one observation, because they settle once."""
+    import band_tuner as bt
+    fills = [{"window": WINDOW, "side": "UP", "stake": 2.5, "shares": 6.0,
+              "fee": 0.1, "price": 0.4},
+             {"window": WINDOW, "side": "UP", "stake": 2.5, "shares": 6.0,
+              "fee": 0.1, "price": 0.4}]
+    s = bt.score(fills, {str(WINDOW): "UP"})
+    check("two fills in one round collapse to one round", s["rounds"] == 1)
+    check("but both their PnL is counted",
+          abs(s["net"] - 2 * (6.0 - 2.5 - 0.1)) < 1e-9, str(s["net"]))
+
+
+def t_tuner_searching_more_cells_raises_the_bar():
+    """The property the floor exists to price: search inflates the best |t|.
+
+    Asserted as a comparison rather than against a fixed number, because the
+    claim is not "the bar is 2.4", it is "the bar goes up when you look in
+    more places" - which is what makes a single cell's t-stat misleading.
+    """
+    import band_tuner as bt
+    by_window, wins = _tape(50, edge=0.5, seed=5)
+    kw = dict(stake=2.50, signal="chainlink", theta=0.07, min_shares=5.0,
+              cap=0.90)
+    wide = bt.build_cells(by_window, list(bt.sweep_bands(
+        [(300, 180), (180, 60)], bt.DEFAULT_GRID)), **kw)
+    one = bt.build_cells(by_window, [("single", (300, 60, 0.30, 0.40))], **kw)
+    floor_wide = bt.noise_floor(wide, wins, nulls=120, seed=0)
+    floor_one = bt.noise_floor(one, wins, nulls=120, seed=0)
+    check("a floor is produced for both", bool(floor_wide) and bool(floor_one))
+    check("searching many cells raises the bar above searching one",
+          floor_wide["median"] > floor_one["median"],
+          f"{len(wide)} cells -> {floor_wide['median']:.2f}, "
+          f"1 cell -> {floor_one['median']:.2f}")
+    check("the 95th percentile is above the median",
+          floor_wide["p95"] >= floor_wide["median"])
+
+
+def t_tuner_p_value_brackets():
+    import band_tuner as bt
+    floor = {"draws": 100, "values": sorted(float(i) / 10 for i in range(100))}
+    check("a t nothing beats is near p = 0",
+          bt.beats_floor(99.0, floor) < 0.02)
+    check("a t everything beats is near p = 1",
+          bt.beats_floor(0.0, floor) > 0.98)
+    check("no floor means no p-value", bt.beats_floor(3.0, {}) is None)
+    check("a non-finite t has no p-value",
+          bt.beats_floor(float("nan"), floor) is None)
+
+
+def t_tuner_rejects_noise_and_detects_signal():
+    """The property the whole tool exists for, at small scale."""
+    import band_tuner as bt
+    kw = dict(stake=2.50, signal="chainlink", theta=0.07, min_shares=5.0,
+              cap=0.90)
+    grid = list(bt.sweep_bands([(300, 180), (180, 60)], bt.DEFAULT_GRID))
+
+    noise_by_w, noise_wins = _tape(60, edge=0.5, seed=7)
+    cells = bt.build_cells(noise_by_w, grid, **kw)
+    floor = bt.noise_floor(cells, noise_wins, nulls=60, seed=0)
+    best = max((bt.score(f, noise_wins)["t"] for _n, _b, f, _m in cells if f),
+               key=lambda t: abs(t) if t == t else 0)
+    p_noise = bt.beats_floor(best, floor)
+    check("a tape with no edge does not clear its own noise floor",
+          p_noise is None or p_noise > 0.05, f"p = {p_noise}")
+
+    edge_by_w, edge_wins = _tape(60, edge=0.85, seed=7)
+    cells = bt.build_cells(edge_by_w, grid, **kw)
+    floor = bt.noise_floor(cells, edge_wins, nulls=60, seed=0)
+    best = max((bt.score(f, edge_wins)["t"] for _n, _b, f, _m in cells if f),
+               key=lambda t: abs(t) if t == t else 0)
+    p_edge = bt.beats_floor(best, floor)
+    check("a tape with a strong edge does clear it",
+          p_edge is not None and p_edge <= 0.05, f"p = {p_edge}")
+
+
+def t_tuner_report_refuses_to_rank_an_empty_tape():
+    import band_tuner as bt
+    by_window, wins = _tape(3, seed=9, price=0.85)   # every price outside band
+    cells = bt.build_cells(by_window, [("x", (300, 60, 0.30, 0.40))],
+                           stake=2.50, signal="chainlink", theta=0.07,
+                           min_shares=5.0, cap=0.90)
+    buf = io.StringIO()
+    stdout, sys.stdout = sys.stdout, buf
+    try:
+        bt.report(cells, wins, {}, title="EMPTY")
+    finally:
+        sys.stdout = stdout
+    check("an unmeasurable sweep says so instead of ranking",
+          "nothing is measurable" in buf.getvalue())
+    check("and it says the search was unadjusted",
+          "unadjusted for the search" in buf.getvalue())
+
 if __name__ == "__main__":
     raise SystemExit(main())

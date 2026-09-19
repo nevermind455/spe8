@@ -84,6 +84,52 @@ were getting.
 If BOOK is red while QUOTE is green, the edge was never there. That is the
 gate doing its job, and it is cheaper to learn here.
 
+## Choosing bands: `band_tuner.py`
+
+`book_backtest.py` answers "what did this schedule do". Picking between many
+schedules is a different question, with an easier way to be wrong: search
+enough cells and one looks good *because* you searched. The register's
+ruled-out table already has an entry for it - "six parameters fitting 57
+rounds".
+
+```bash
+python3 band_tuner.py --sweep
+python3 band_tuner.py --compare "live=300:240:0.35:0.45,...;reserveA=..."
+```
+
+It prints the noise floor first, on purpose:
+
+```
+NOISE FLOOR (300 shuffled sweeps of the same 44 cells)
+  with NO edge at all, the best cell still reaches |t| = 4.82 typically,
+  6.01 at the 95th pct, 7.11 at worst.
+  a cell must clear 6.01 to mean anything. Beating zero is not the bar.
+```
+
+That floor is measured, not assumed: the recorded outcomes are reshuffled
+across rounds and the whole sweep re-run, many times. Shuffling keeps every
+round's real prices, real depth and real signal reading, and breaks only the
+link between the signal and the winner - which is exactly what a real edge
+claims to have. Each cell's `p` is the share of null sweeps whose best cell
+beat it.
+
+Fills are clustered by round before any statistic is taken, because fills
+inside one 5-minute round share one settlement. `edge_test.py` already owned
+that clustering and the t-statistic; this imports them rather than growing a
+second copy.
+
+Validated both directions on synthetic tapes:
+
+| tape | 120 rounds | 400 rounds |
+|---|---|---|
+| a real 58% signal | p = 0.083 | **p = 0.003** |
+| pure coin flips | p = 0.206 | p = 0.076 |
+
+A real effect grows with the sample. A lucky one does not. Note the second
+row at 400 rounds reached |t| = 8.15 on a tape built from coin flips - by the
+naive |t| > 2 bar it was overwhelmingly "significant". That is the number the
+floor exists to refuse.
+
 ## What this does not claim
 
 * **Latency.** A snapshot is the book at the moment it was read. Your order
@@ -108,3 +154,7 @@ Covers the ladder walk, the venue-minimum parity with the live order path,
 per-parcel fees, settlement, the unresolved/split skips, one entry per band
 per round, the tape surviving a recorder killed mid-write, and the refusal to
 record a book the freshness checks rejected.
+
+For the tuner: round clustering, misses counted as misses rather than as
+wins, the noise floor rising when more cells are searched, and the
+reject-noise/detect-signal property end to end.
