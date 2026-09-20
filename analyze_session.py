@@ -248,7 +248,7 @@ def fill_delay_section(journal: pathlib.Path, pos: dict) -> None:
     for title, keep in groups:
         stats = collections.defaultdict(lambda: {
             "orders": 0, "fill": 0, "won": 0, "px": 0.0,
-            "miss": 0, "miss_won": 0})
+            "miss": 0, "miss_won": 0, "rounds": set()})
         dropped = set()
         for r in rows:
             oid = r.get("order_id")
@@ -265,6 +265,10 @@ def fill_delay_section(journal: pathlib.Path, pos: dict) -> None:
             key = (PAPER if r.get("reason") == "actual paper fill"
                    else float(r.get("delay_s") or 0.0))
             s = stats[key]
+            # Independent observations are rounds; several probes of the same
+            # round are one bet, whatever the delay.
+            if r.get("window_end"):
+                s["rounds"].add(r["window_end"])
             s["orders"] += 1
             if r["fillable"]:
                 s["fill"] += 1
@@ -293,8 +297,9 @@ def fill_delay_section(journal: pathlib.Path, pos: dict) -> None:
             if s["fill"]:
                 win = s["won"] / s["fill"]
                 px = s["px"] / s["fill"]
+                rounds = len(s["rounds"]) or s["fill"]
                 middle = (f"{win * 100:>7.1f}%{px:>8.3f}{win - px:>+8.3f}"
-                          f"  {sig(s['fill'], win, px):<13}")
+                          f"  {sig(rounds, win, px):<13}")
             else:
                 middle = f"{'--':>8}{'--':>8}{'--':>8}{'':>15}"
             missed = (f"{s['miss_won'] / s['miss'] * 100:>11.1f}%"
@@ -732,10 +737,11 @@ def paper_report(base: pathlib.Path) -> int:
             avg_px = d["px"] / d["n"]
             win = d["won"] / d["n"]
             pnl = d["pay"] - d["cost"]
-            print(f"{k:<9}{d['n']:>6}{avg_px:>8.3f}{d['cost']:>10.2f}"
-                  f"{pnl:>+10.2f}{pnl / d['cost'] * 100:>8.1f}%"
-                  f"{win * 100:>6.0f}%{win - avg_px:>+8.3f}"
-                  f"  {sig(d['n'], win, avg_px)}")
+            print(f"{k:<9}{d['n']:>6}{bucket_rounds(d):>6}{avg_px:>8.3f}"
+                  f"{d['cost']:>9.2f}{pnl:>+9.2f}"
+                  f"{pnl / d['cost'] * 100:>7.1f}%"
+                  f"{win * 100:>5.0f}%{win - avg_px:>+8.3f}"
+                  f"  {sig(bucket_rounds(d), win, avg_px)}")
         print("   EDGE = win rate minus average price paid. Negative means the")
         print("   signal is worse than the quote it is paying.")
 
