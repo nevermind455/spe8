@@ -1192,6 +1192,33 @@ def t_paper_fixes_the_stake_before_the_delay_like_a_signed_order():
               str(steady.last_fill["shares"]))
 
 
+def t_paper_refuses_to_size_an_order_from_a_stale_book():
+    """The book an order is SIZED from must be as fresh as the one it fills on.
+
+    Fixing the stake at decision time introduced a second book read, and it
+    was validated only for shape - not for age. Live gets that check for
+    free: every read goes through parse_orderbook, which enforces
+    ORDERBOOK_MAX_AGE_SECONDS, so live can never size off a book paper would
+    happily have used.
+    """
+    stale = BookSnapshot(
+        "up", ((D("0.40"), D("50")),), tick_size=D("0.01"),
+        timestamp=str(int(time.time() * 1000)), book_hash="abc",
+        received_wall=time.time() - 40.0, best_bid=D("0.39"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        broker = _inflight_broker(tmp, [stale, _book_at(0.40)])
+        check("a stale decision book is refused before any sizing",
+              paper_order(broker, amount=2) is False, str(broker.last_error))
+        check("and it says the book was stale, not that the price was wrong",
+              "stale in hand" in (broker.last_error or ""), str(broker.last_error))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        arrival = _inflight_broker(tmp, [_book_at(0.40), stale])
+        check("a stale arrival book is still refused too",
+              paper_order(arrival, amount=2) is False, str(arrival.last_error))
+
+
 def main() -> int:
     for name, test in sorted(globals().items()):
         if not name.startswith("t_") or not callable(test):

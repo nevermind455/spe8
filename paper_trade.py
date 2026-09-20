@@ -1082,12 +1082,7 @@ class PaperBroker:
             # its stake against the very book it was about to fill on, which
             # is information a real order never has.
             decision_book = self._book_fetch(str(token_id))
-            if not isinstance(decision_book, BookSnapshot):
-                raise PaperRejected("invalid public order book response")
-            if not decision_book.asks:
-                raise PaperRejected(
-                    f"cannot FOK buy {side}: no asks on the live book "
-                    "(liquidity pulled or one-sided)")
+            self._check_book(decision_book, side)
             spend = size_to_venue_minimum(amount, decision_book, rules, cap)
             if spend > Decimal(str(amount)):
                 print(
@@ -1099,38 +1094,8 @@ class PaperBroker:
             if timer.unix() >= cutoff:
                 raise PaperRejected("paper latency reached the round cutoff")
             book = self._book_fetch(str(token_id))
-            if not isinstance(book, BookSnapshot):
-                raise PaperRejected("invalid public order book response")
-            if book.timestamp is None:
-                raise PaperRejected("public order book omitted exchange timestamp")
-            if not math.isfinite(book.received_wall) or book.received_wall <= 0:
-                raise PaperRejected("public order book omitted receipt time")
-            try:
-                book_ts_s, _unit = timer.parse_exchange_ts(book.timestamp)
-            except ValueError as exc:
-                raise PaperRejected("public order book has an invalid timestamp") from exc
-            now_wall = timer.wall()
-            # Quiet = how long since the venue last changed the book.
-            # Held = how long this copy has been in our hands. The live
-            # orderbook parser already splits these; conflating them with
-            # ORDERBOOK_MAX_AGE_SECONDS (8s) refused ordinary quiet
-            # btc-updown-5m books (33s+ between changes) as "stale".
-            quiet_s = now_wall - book_ts_s
-            held_s = now_wall - book.received_wall
+            quiet_s, held_s = self._check_book(book, side)
             book_age_s = quiet_s
-            if quiet_s < -self.future_tol_s:
-                raise PaperRejected(
-                    f"public order book is future-dated (age={quiet_s:.3f}s)")
-            if held_s > self.max_book_age_s:
-                raise PaperRejected(
-                    f"public order book is stale in hand (held={held_s:.3f}s)")
-            if quiet_s > self.max_quiet_s:
-                raise PaperRejected(
-                    f"public order book has not changed for {quiet_s:.3f}s")
-            if not book.asks:
-                raise PaperRejected(
-                    f"cannot FOK buy {side}: no asks on the live book "
-                    "(liquidity pulled or one-sided)")
             # A real executable spread requires both sides of the same,
             # timestamped venue snapshot.
             best_bid = book.best_bid
@@ -1309,6 +1274,49 @@ class PaperBroker:
                     fh.write(json.dumps(row, sort_keys=True, default=str) + "\n")
         except Exception:
             pass
+
+    def _check_book(self, book, side: str) -> tuple:
+        """Validate a book and return (quiet_s, held_s). Raises otherwise.
+
+        Both the book an order is SIZED from and the book it FILLS against
+        have to pass this. Live gets that for free - every read goes through
+        parse_orderbook, which enforces ORDERBOOK_MAX_AGE_SECONDS - so a
+        paper path that skipped it on either read would size or fill from
+        data live would have refused outright.
+        """
+        if not isinstance(book, BookSnapshot):
+            raise PaperRejected("invalid public order book response")
+        if book.timestamp is None:
+            raise PaperRejected("public order book omitted exchange timestamp")
+        if not math.isfinite(book.received_wall) or book.received_wall <= 0:
+            raise PaperRejected("public order book omitted receipt time")
+        try:
+            book_ts_s, _unit = timer.parse_exchange_ts(book.timestamp)
+        except ValueError as exc:
+            raise PaperRejected(
+                "public order book has an invalid timestamp") from exc
+        now_wall = timer.wall()
+        # Quiet = how long since the venue last changed the book.
+        # Held = how long this copy has been in our hands. The live
+        # orderbook parser already splits these; conflating them with
+        # ORDERBOOK_MAX_AGE_SECONDS (8s) refused ordinary quiet
+        # btc-updown-5m books (33s+ between changes) as "stale".
+        quiet_s = now_wall - book_ts_s
+        held_s = now_wall - book.received_wall
+        if quiet_s < -self.future_tol_s:
+            raise PaperRejected(
+                f"public order book is future-dated (age={quiet_s:.3f}s)")
+        if held_s > self.max_book_age_s:
+            raise PaperRejected(
+                f"public order book is stale in hand (held={held_s:.3f}s)")
+        if quiet_s > self.max_quiet_s:
+            raise PaperRejected(
+                f"public order book has not changed for {quiet_s:.3f}s")
+        if not book.asks:
+            raise PaperRejected(
+                f"cannot FOK buy {side}: no asks on the live book "
+                "(liquidity pulled or one-sided)")
+        return quiet_s, held_s
 
     def _reject(self, side, amount, reason: str) -> bool:
         reason = reason or "paper order rejected"
