@@ -724,6 +724,37 @@ def _refresh_durable_round_state(window_start: int, condition_id: str | None,
     return current, merged
 
 
+_decision_observer = None
+_execution_block_reason_provider = None
+
+
+def _log_decision(row: dict) -> None:
+    """Hand one decision-point record to the runner, or drop it.
+
+    main_bot does no file IO of its own; run_feeds installs the writer. A
+    telemetry failure must never interrupt a trading decision, so everything
+    here is swallowed.
+    """
+    observer = _decision_observer
+    if observer is None:
+        return
+    try:
+        observer(row)
+    except Exception:
+        pass
+
+
+def _execution_block_reason(condition_id: str | None) -> str:
+    """Best available explanation for a readiness refusal."""
+    provider = _execution_block_reason_provider
+    if provider is None:
+        return "no readiness reason provider installed"
+    try:
+        return str(provider(condition_id) or "readiness refused without a reason")
+    except Exception as exc:
+        return f"readiness reason unavailable ({type(exc).__name__})"
+
+
 def _execution_ready(mode: str, condition_id: str | None) -> bool:
     """Paper is self-accounting; LIVE requires its private fill stream."""
     if mode != "LIVE":
@@ -2014,8 +2045,36 @@ async def run_bot():
                 phase2_gate_until = _phase2_deadline(0.2)
                 continue
             if not _execution_ready(mode, tokens["condition_id"]):
+                # Finding 5: this gate exists only in LIVE, so PAPER takes
+                # trades LIVE structurally will not. Recording what PAPER
+                # would have attempted here is the only way to measure how
+                # much of paper's apparent edge comes from those trades.
+                # The gate itself is unchanged - this only describes it.
+                block_reason = _execution_block_reason(tokens["condition_id"])
+                order_token = up_id if entry_side == "UP" else down_id
+                best_ask = None
+                try:
+                    _rb, ra = await asyncio.to_thread(
+                        orderbook.get_orderbook, order_token)
+                    best_ask = float(ra[0]["price"]) if ra else None
+                except Exception:
+                    best_ask = None
+                _log_decision({
+                    "event": "execution_blocked", "wall": timer.unix(),
+                    "window": active_window, "mode": mode,
+                    "condition_id": tokens["condition_id"],
+                    "token_id": str(order_token), "side": entry_side,
+                    "signal_side": side, "execution_ready": False,
+                    "block_reason": block_reason,
+                    "paper_would_attempt": True,
+                    "requested_notional": float(entry_amount),
+                    "limit_price": float(entry_max_price),
+                    "floor_price": float(entry_min_price),
+                    "best_ask": best_ask,
+                    "seconds_left": float(round_end - timer.unix()),
+                })
                 print(f"{_ts()} [RISK] No order: private fill stream lost "
-                      "readiness before submission.")
+                      f"readiness before submission ({block_reason}).")
                 phase2_gate_until = _phase2_deadline(0.2)
                 continue
 

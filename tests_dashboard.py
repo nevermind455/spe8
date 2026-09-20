@@ -863,7 +863,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # purchase now prices the finished pair at the submit choke point
     # (COMPLEMENT_REQUIRES_PROFIT). A matched pair pays exactly $1.00, and
     # 72 of 89 completed pairs had cost more than that.
-    "main_bot.py": "1d4ed235ee481b46961f8f86f58bb0eda965163862d0c225dd75c0db80a68251",
+    # main_bot.py, config.py re-approved 2026-09-22: execution-readiness
+    # telemetry (Finding 5) and the PAPER/LIVE strategy parity report.
+    # The LIVE readiness gate is unchanged - it is only described now.
+    "main_bot.py": "1a2d659176ce8a4feeaa61b189a82301f0146196da03d71a2a4285b52e5ebf96",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     # config.py, polymarket_trade.py re-approved 2026-09-16: paper fill-delay
     # probes (PAPER_FILL_DELAY_PROBES) and live POST timing. Both diagnostic:
@@ -885,7 +888,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # config.py re-approved 2026-09-22: PAPER_ADVERSE_FILL_TICKS models the
     # paper-to-live leak - paper filled whenever the book allowed, live only
     # when the offer survived the round trip. PAPER-side only.
-    "config.py": "fa3d2287a8d26ac86992b93d23673426fffaeede6aab8ebf40a11590c45fa2c7",
+    "config.py": "606124c09e200cd7f4689a71dad08517f5035f7b59d5a110d477691b16a17396",
 }
 
 

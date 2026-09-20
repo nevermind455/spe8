@@ -3135,6 +3135,110 @@ def t_guard_rejection_reason_reaches_both_brokers():
         check("valid guard still passes", helper(lambda: True) is None)
 
 
+def t_strategy_parity_exposes_a_paper_live_difference():
+    """PAPER and LIVE must agree on WHAT to trade, or no paper result holds.
+
+    The two modes have separate knobs for the same strategy decision, and
+    nothing ever compared them. A silent difference means the paper run is
+    measuring a different strategy from the live one - which is exactly the
+    failure this whole audit exists to catch.
+    """
+    import importlib
+    import os
+    import config as cfg
+
+    saved = dict(os.environ)
+    try:
+        os.environ["PAPER_ALLOW_SIGNAL_FLIPS"] = "1"
+        os.environ["LIVE_ALLOW_SIGNAL_FLIPS"] = "0"
+        os.environ["PHASE1_ENABLED"] = "0"
+        os.environ["PHASE2_ENABLED"] = "1"
+        importlib.reload(cfg)
+        ok, diffs = cfg.strategy_parity()
+        lines = cfg.parity_report_lines()
+        check("a strategy difference fails parity", ok is False, str(diffs))
+        check("the failing setting is named with both values",
+              len(diffs) == 1 and diffs[0]["paper"] is True
+              and diffs[0]["live"] is False, str(diffs))
+        check("the report says FAIL", lines and "FAIL" in lines[0], str(lines))
+        check("and it does not silently normalise the values",
+              cfg.PAPER_ALLOW_SIGNAL_FLIPS is True
+              and cfg.LIVE_ALLOW_SIGNAL_FLIPS is False)
+
+        os.environ["LIVE_ALLOW_SIGNAL_FLIPS"] = "1"
+        importlib.reload(cfg)
+        ok_now, diffs_now = cfg.strategy_parity()
+        check("matching settings pass parity", ok_now is True, str(diffs_now))
+        check("execution-model settings are not required to match",
+              "PAPER_LATENCY_MS" not in
+              {d["paper_setting"] for d in diffs_now}, str(diffs_now))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        importlib.reload(cfg)
+
+
+def t_execution_readiness_block_is_recorded_with_its_reason():
+    """Finding 5: LIVE refuses trades PAPER takes, and it was never counted.
+
+    _execution_ready gates LIVE only. It stays exactly as it is - this pins
+    that a refusal is now explained and journalled, so the share of paper's
+    edge that LIVE could never have reached becomes measurable instead of
+    invisible.
+    """
+    import main_bot
+
+    saved_obs = main_bot._decision_observer
+    saved_reason = main_bot._execution_block_reason_provider
+    saved_ready = main_bot._execution_ready_provider
+    rows = []
+    try:
+        main_bot._decision_observer = rows.append
+        main_bot._execution_block_reason_provider = (
+            lambda _c: "private stream status is DISCONNECTED, not LIVE")
+        main_bot._log_decision({"event": "execution_blocked", "token_id": "1"})
+        check("a blocked decision reaches the journal", len(rows) == 1, str(rows))
+        check("the reason provider is used verbatim",
+              main_bot._execution_block_reason("cond")
+              == "private stream status is DISCONNECTED, not LIVE")
+
+        main_bot._execution_block_reason_provider = None
+        check("a missing reason provider still yields a reason, not a crash",
+              "no readiness reason provider" in
+              main_bot._execution_block_reason("cond"))
+
+        def explode(_c):
+            raise RuntimeError("stream object gone")
+
+        main_bot._execution_block_reason_provider = explode
+        check("a raising reason provider is reported, not propagated",
+              "RuntimeError" in main_bot._execution_block_reason("cond"))
+
+        # Telemetry must never be able to stop a trading decision.
+        def bad_observer(_row):
+            raise OSError("disk full")
+
+        main_bot._decision_observer = bad_observer
+        raised = None
+        try:
+            main_bot._log_decision({"event": "execution_blocked"})
+        except Exception as exc:
+            raised = exc
+        check("a failing journal never interrupts the decision loop",
+              raised is None, repr(raised))
+
+        # The gate itself must be unchanged: LIVE without a provider refuses.
+        main_bot._execution_ready_provider = None
+        check("LIVE still fails closed with no readiness provider",
+              main_bot._execution_ready("LIVE", "cond") is False)
+        check("PAPER is still self-accounting and always ready",
+              main_bot._execution_ready("PAPER", "cond") is True)
+    finally:
+        main_bot._decision_observer = saved_obs
+        main_bot._execution_block_reason_provider = saved_reason
+        main_bot._execution_ready_provider = saved_ready
+
+
 def main():
     # A crashing test must be one failure, not a suite that stops reporting.
     def run(fn, is_async=False):

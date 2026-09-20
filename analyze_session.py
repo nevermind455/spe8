@@ -28,6 +28,12 @@ import os
 import pathlib
 import statistics
 import sys
+import time
+
+# An accepted order is not a zero fill until late private-stream fills can no
+# longer arrive. Rounds resolve at window_end; this is the grace period after
+# it before UNRESOLVED becomes ACCEPTED_ZERO_FILL.
+FINALISE_AFTER_S = 900.0
 
 ROOT = pathlib.Path(__file__).parent
 try:
@@ -274,6 +280,41 @@ def fill_delay_section(journal: pathlib.Path, pos: dict) -> None:
         print("   fills lose the winners - the adverse selection live showed.")
 
 
+def readiness_section(path: pathlib.Path) -> None:
+    """Decisions LIVE refused to execute that PAPER would have taken.
+
+    _execution_ready gates LIVE only: paper is self-accounting, live requires
+    its private fill stream. That is a deliberate safety gate and stays, but
+    it means paper trades LIVE structurally will not - so part of paper's
+    apparent edge may come from orders live could never have placed. This
+    counts them and says why.
+    """
+    if not path.is_file():
+        return
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("event") == "execution_blocked":
+            rows.append(row)
+    if not rows:
+        return
+    reasons = collections.Counter(r.get("block_reason") or "unknown"
+                                  for r in rows)
+    notional = sum(float(r.get("requested_notional") or 0.0) for r in rows)
+    print(f"\nREADINESS   {len(rows)} decisions PAPER would have taken and "
+          f"LIVE refused")
+    print(f"            ${notional:,.2f} of intended notional never submitted")
+    for reason, n in reasons.most_common():
+        print(f"            {n:>5}  {reason}")
+    print("            These are not rejections by the venue: the order was")
+    print("            never sent. A paper edge built on them is not live-")
+    print("            reachable. Hypothetical P&L needs the round outcomes,")
+    print("            joined by window and token from the ledger.")
+
+
 def attempts_section(path: pathlib.Path, orders: dict) -> None:
     """What LIVE actually did with every intended order.
 
@@ -316,14 +357,25 @@ def attempts_section(path: pathlib.Path, orders: dict) -> None:
             outcome["submission failed"] += 1
             continue
         if not accepted:
-            outcome["submitted, never filled"] += 1
+            outcome["REJECTED"] += 1
             continue
         oid = accepted[-1].get("order_id")
         got = orders.get(oid)
         if not got or got.get("sh", 0) <= 0:
-            outcome["accepted, no confirmed fill"] += 1
+            # An accepted order with no confirmed lot is NOT a zero fill
+            # until its round is over: a private-stream fill can arrive late,
+            # and classifying at POST time would invent zero fills. Before
+            # the round ends the honest label is UNRESOLVED.
+            window_end = float(attempt.get("window_end") or 0) if attempt else 0
+            settled_by = window_end + FINALISE_AFTER_S
+            outcome["ACCEPTED_ZERO_FILL" if window_end and time.time() > settled_by
+                    else "UNRESOLVED (awaiting late fills)"] += 1
             continue
-        outcome["filled"] += 1
+        expected = float((attempt or {}).get("expected_shares") or 0.0)
+        if expected and got["sh"] + 1e-9 < expected:
+            outcome["ACCEPTED_PARTIAL"] += 1
+        else:
+            outcome["ACCEPTED_FILLED"] += 1
         if attempt:
             exp_sh = attempt.get("expected_shares")
             exp_px = attempt.get("expected_vwap")
@@ -342,7 +394,8 @@ def attempts_section(path: pathlib.Path, orders: dict) -> None:
           f"({len(events)} journalled)")
     for name, n in outcome.most_common():
         print(f"            {name:<32}{n:>5}  {n / total * 100:>5.1f}%")
-    filled = outcome.get("filled", 0)
+    filled = (outcome.get("ACCEPTED_FILLED", 0)
+              + outcome.get("ACCEPTED_PARTIAL", 0))
     print(f"            LIVE FILL RATE {filled / total * 100:.1f}%"
           f"  - the number PAPER has to reproduce")
 
@@ -751,6 +804,7 @@ def live_report(base: pathlib.Path) -> int:
               f"   {sig(total['n'], win, avg_px)}")
     print_bands(bands)
     pairs_section(held)
+    readiness_section(path("LIVE_DECISIONS_PATH", "live_decisions.jsonl"))
     attempts_section(path("LIVE_ATTEMPTS_PATH", "live_attempts.jsonl"), orders)
     live_timing_section(
         path("LIVE_FILL_TIMING_PATH", "live_fill_timing.jsonl"), orders)

@@ -645,6 +645,8 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
     main_bot._round_held_tokens_provider = None
     main_bot._round_leg_basis_provider = None
     main_bot._execution_ready_provider = None
+    main_bot._execution_block_reason_provider = None
+    main_bot._decision_observer = None
 
     broker = None
     if paper:
@@ -757,6 +759,21 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         main_bot._round_leg_basis_provider = (
             lambda condition, token: ledger.open_leg_basis(condition, token))
         main_bot._execution_ready_provider = hub.user.ready_for_market
+        # Explains a refusal without being the gate; see Finding 5.
+        main_bot._execution_block_reason_provider = hub.user.ready_reason_for_market
+
+        _decision_path = _state_path("LIVE_DECISIONS_PATH",
+                                     "live_decisions.jsonl")
+
+        def _write_decision(row: dict) -> None:
+            """Append-only decision journal. Never interrupts trading."""
+            try:
+                with open(_decision_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+            except Exception:
+                polymarket_trade.attempt_log_failures += 1
+
+        main_bot._decision_observer = _write_decision
 
     # Prove the accounting directory is writable before any feed or order task
     # starts. A bot that cannot durably journal fills is not safe to run.
@@ -778,6 +795,19 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
                                     on_event=on_event)
 
     mode = "PAPER (NO WALLET / NO SIGNATURE / NO LIVE ORDERS)" if paper else "LIVE"
+    # PAPER and LIVE must agree on WHAT to trade or no paper result can
+    # predict a live one. Printed every start, and persisted beside the
+    # ledger so a session's parity can be checked after the fact.
+    parity_lines = config.parity_report_lines()
+    for line in parity_lines:
+        print(f"[FEEDS] {line}")
+    try:
+        _state_path("STRATEGY_PARITY_PATH", "strategy_parity.txt").write_text(
+            "\n".join(parity_lines) + "\n", encoding="utf-8")
+    except Exception as exc:
+        print(f"[FEEDS] could not persist the parity report: "
+              f"{type(exc).__name__}")
+
     banner = f"[FEEDS] MODE={mode} | {cfg.describe()}"
     print(banner)
     if not cfg.decisions_unchanged:
@@ -908,6 +938,8 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         main_bot._round_held_tokens_provider = None
         main_bot._round_leg_basis_provider = None
         main_bot._execution_ready_provider = None
+        main_bot._execution_block_reason_provider = None
+        main_bot._decision_observer = None
         main_bot._accounting_enabled = False
         main_bot._strike = None
         for t in tasks:
