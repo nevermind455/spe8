@@ -5,6 +5,7 @@ import pathlib
 import sys
 import re
 import threading
+import uuid
 import time
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from urllib.parse import urlsplit
@@ -651,6 +652,40 @@ def _ambiguous_blocks(condition_id: str, token_id: str) -> bool:
     return str(token_id) in _ambiguous_tokens
 
 
+attempt_log_failures = 0
+
+
+def _attempt_log(row: dict) -> None:
+    """Append one row to the append-only live attempt journal.
+
+    Every INTENDED live order must appear here, including ones that never
+    reach the venue, are rejected, or never fill. Without the orders that did
+    NOT fill there is no live fill rate, and with no live fill rate PAPER
+    cannot be calibrated against LIVE at all - which is the whole reason a
+    profitable paper run kept losing money live.
+
+    Rows are never rewritten. One attempt emits several events and its history
+    is reconstructed by joining them on attempt_id, so a crash mid-order
+    leaves evidence rather than a gap.
+
+    A logging failure must never stop trading, but it must not pass silently
+    either: it increments attempt_log_failures for the runner to surface.
+    """
+    global attempt_log_failures
+    try:
+        import json as _json
+        target = os.environ.get("LIVE_ATTEMPTS_PATH")
+        if not target:
+            if pathlib.Path(sys.argv[0]).name.startswith("tests_"):
+                return
+            target = str(pathlib.Path(__file__).resolve().parent
+                         / "live_attempts.jsonl")
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row, sort_keys=True, default=str) + "\n")
+    except Exception:
+        attempt_log_failures += 1
+
+
 def _record_fill_timing(order_id, status, error, submitted_wall, responded_wall,
                         *, token_id, condition_id) -> None:
     """Append when a live order was POSTed and when the venue answered.
@@ -876,6 +911,11 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         last_order_error = "missing or invalid current condition id"
         return False
     token_id = str(up_token_id if side == "UP" else down_token_id)
+    # Minted BEFORE any network call, so an order that dies in preflight, is
+    # rejected, or never fills still has an identity in the telemetry.
+    attempt_id = uuid.uuid4().hex
+    decision_wall = time.time()
+    decision_mono = time.monotonic()
 
     try:
         end = _validate_round_end(window_end)
@@ -918,6 +958,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         if floor > limit:
             raise RuntimeError(
                 "the effective price floor is above the order's price cap")
+        book_read_wall = time.time()
         _bids, asks = orderbook.validate_buy_liquidity(
             token_id, amount, float(limit), config.MAX_ALLOWED_SPREAD,
             min_price=float(floor))
@@ -949,8 +990,53 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         _validate_round_end(end)
     except Exception as exc:
         last_order_error = _safe_error(exc)
+        # An intended order that never reached the venue is still an attempt.
+        _attempt_log({
+            "attempt_id": attempt_id, "event": "blocked", "wall": time.time(),
+            "decision_wall": decision_wall,
+            "elapsed_ms": (time.monotonic() - decision_mono) * 1000.0,
+            "condition_id": str(condition_id), "token_id": str(token_id),
+            "side": side, "order_side": "BUY", "window_end": window_end,
+            "requested_notional": amount, "final_status": "BLOCKED",
+            "reason": last_order_error[:200],
+        })
         print(f"[LIVE] Order preflight failed: {last_order_error}")
         return False
+
+    # Everything the venue was asked for, and what the book said it should
+    # get, recorded BEFORE the first submission. Joined later to the confirmed
+    # lots in the ledger by order id.
+    try:
+        _best_ask = float(asks[0]["price"]) if asks else None
+        _best_bid = float(_bids[0]["price"]) if _bids else None
+        _exp_shares = float(shares)
+        _exp_vwap = float(amount) / _exp_shares if _exp_shares > 0 else None
+        _attempt_log({
+            "attempt_id": attempt_id, "event": "attempt", "wall": time.time(),
+            "decision_wall": decision_wall, "book_read_wall": book_read_wall,
+            # The venue's own book timestamp is not exposed at this layer.
+            # What IS proven is that parse_orderbook accepted the book inside
+            # ORDERBOOK_MAX_AGE_SECONDS, so this is an upper bound, not the
+            # measured age. Closing that gap is a named follow-up.
+            "book_age_bound_s": float(config.ORDERBOOK_MAX_AGE_SECONDS),
+            "condition_id": str(condition_id), "token_id": str(token_id),
+            "side": side, "order_side": "BUY", "order_type": "FOK",
+            "window_end": window_end,
+            "best_bid": _best_bid, "best_ask": _best_ask,
+            "spread": (_best_ask - _best_bid
+                       if _best_ask is not None and _best_bid is not None
+                       else None),
+            "requested_notional": float(amount),
+            "limit_price": float(limit), "floor_price": float(floor),
+            "expected_shares": _exp_shares,
+            "expected_vwap": _exp_vwap,
+            "expected_fee": float(estimated_fee),
+            "expected_slippage": (_exp_vwap - _best_ask
+                                  if _exp_vwap is not None
+                                  and _best_ask is not None else None),
+        })
+    except Exception:
+        attempt_log_failures += 1
 
     # Retry only an explicit FOK no-fill.  Every retry rebuilds and re-signs;
     # transport timeouts remain ambiguous and are never retried.
@@ -991,6 +1077,13 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             _record_fill_timing(None, "post_raised", err, submitted_wall,
                                 time.time(), token_id=token_id,
                                 condition_id=condition_id)
+            _attempt_log({
+                "attempt_id": attempt_id, "event": "post", "try": attempt,
+                "wall": time.time(), "submitted_wall": submitted_wall,
+                "post_seconds": time.time() - submitted_wall,
+                "order_id": None, "status": "POST_RAISED",
+                "final_status": "SUBMIT_FAILED", "reason": err[:200],
+            })
             if _is_no_match(err) and attempt < 2:
                 time.sleep(0.5)
                 continue
@@ -1005,6 +1098,15 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
         oid, status, err = _accepted_order_response(resp)
         _record_fill_timing(oid, status, err, submitted_wall, responded_wall,
                             token_id=token_id, condition_id=condition_id)
+        _attempt_log({
+            "attempt_id": attempt_id, "event": "post", "try": attempt,
+            "wall": responded_wall, "submitted_wall": submitted_wall,
+            "responded_wall": responded_wall,
+            "post_seconds": responded_wall - submitted_wall,
+            "order_id": oid, "status": None if status is None else str(status),
+            "final_status": ("ACCEPTED" if err is None else "REJECTED"),
+            "reason": (_safe_error(err)[:200] if err else None),
+        })
         if err is not None:
             err = _safe_error(err)
             if _is_no_match(err) and attempt < 2:

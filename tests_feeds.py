@@ -1696,7 +1696,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # probes (PAPER_FILL_DELAY_PROBES) and live POST timing. Both diagnostic:
     # nothing reads them for a decision. Paper had assumed instant matching
     # and live won 10.5 points less often at the same prices.
-    "polymarket_trade.py": "4e588de79852420c02ff0d7658b8cd393bc0cc381ab844a0382339d8bdfcf8ae",
+    # polymarket_trade.py re-approved 2026-09-22: live attempt telemetry.
+    # Every intended order is journalled BEFORE submission, so orders that
+    # never fill finally exist in the record - the live fill rate was
+    # previously unknowable because only matched orders were kept.
+    "polymarket_trade.py": "5697309c72c01d388996dd1d8d52bcb33d896088eedfeb309df1d66204b58cb7",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
     "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",

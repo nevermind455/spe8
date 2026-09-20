@@ -869,7 +869,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # probes (PAPER_FILL_DELAY_PROBES) and live POST timing. Both diagnostic:
     # nothing reads them for a decision. Paper had assumed instant matching
     # and live won 10.5 points less often at the same prices.
-    "polymarket_trade.py": "4e588de79852420c02ff0d7658b8cd393bc0cc381ab844a0382339d8bdfcf8ae",
+    # polymarket_trade.py re-approved 2026-09-22: live attempt telemetry.
+    # Every intended order is journalled BEFORE submission, so orders that
+    # never fill finally exist in the record - the live fill rate was
+    # previously unknowable because only matched orders were kept.
+    "polymarket_trade.py": "5697309c72c01d388996dd1d8d52bcb33d896088eedfeb309df1d66204b58cb7",
     "orderbook.py": "8703282757604df1b8c269334168ec730960785cf038234046e29671840ab0cb",
     "chainlink.py": "c638f4276249b48131592d31a57f808565509e7d12be6db2d5b73b2dff1513b8",
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
@@ -1559,6 +1563,199 @@ def test_positions_panel_holds_geometry_at_every_size() -> None:
 
 
 # -------------------------------------------------------------------- main ---
+def _telemetry_client(trade, response, raises=None):
+    """A venue stub whose post_order behaviour the caller chooses."""
+    up, down = "101", "202"
+
+    class FakeClient:
+        def get_clob_market_info(self, _condition):
+            return {"t": [{"o": "Up", "t": up}, {"o": "Down", "t": down}],
+                    "mos": "1", "mts": "0.01", "nr": False,
+                    "fd": {"r": "0.07", "e": 1, "to": True}, "itode": False}
+
+        def get_balance_allowance(self, *_a, **_kw):
+            return {"balance": "100000000",
+                    "allowances": {"exchange": "100000000",
+                                   "neg_risk": "100000000"}}
+
+        def create_market_order(self, *_a, **_kw):
+            return "signed"
+
+        def post_order(self, *_a, **_kw):
+            if raises is not None:
+                raise raises
+            return response
+
+    return FakeClient()
+
+
+def t_live_attempt_telemetry_records_every_intended_order():
+    """An order that never fills must still exist in the telemetry.
+
+    The ledger journals only orders that MATCHED - 221 of 221 entries in the
+    real live ledger carried trade evidence - so orders that were rejected or
+    simply never filled left no trace at all. Without them there is no live
+    fill rate, and with no live fill rate PAPER cannot be calibrated against
+    LIVE. That is why the same strategy showed a profit in paper and lost
+    money live with nothing in the record to explain it.
+    """
+    import json
+    import os
+    import tempfile
+    import types
+    import polymarket_trade as trade
+
+    up, down = "101", "202"
+    condition = "0x" + "a" * 64
+    window_end = (int(trade.time.time()) // 300 + 1) * 300
+    saved = {
+        "client": trade._client,
+        "side": getattr(trade, "Side", None),
+        "otype": getattr(trade, "OrderType", None),
+        "moa": getattr(trade, "MarketOrderArgs", None),
+        "pcoo": getattr(trade, "PartialCreateOrderOptions", None),
+        "vbl": trade.orderbook.validate_buy_liquidity,
+        "asset": getattr(trade, "AssetType", None),
+        "bap": getattr(trade, "BalanceAllowanceParams", None),
+        "last_secs": trade.config.TRADE_LAST_SECONDS,
+        "min_expiry": trade.config.MIN_SECONDS_TO_EXPIRY,
+        "observer": None,
+        "env": os.environ.get("LIVE_ATTEMPTS_PATH"),
+        "ambig_cond": trade._ambiguous_condition,
+        "ambig_tokens": set(trade._ambiguous_tokens),
+    }
+    tmp = tempfile.mkdtemp()
+    journal = pathlib.Path(tmp) / "live_attempts.jsonl"
+    try:
+        os.environ["LIVE_ATTEMPTS_PATH"] = str(journal)
+        trade.Side = types.SimpleNamespace(BUY="BUY")
+        trade.OrderType = types.SimpleNamespace(FOK="FOK")
+        trade.MarketOrderArgs = lambda **kw: kw
+        trade.PartialCreateOrderOptions = lambda **kw: kw
+        trade.AssetType = types.SimpleNamespace(COLLATERAL="COLLATERAL")
+        trade.BalanceAllowanceParams = lambda **kw: kw
+        trade.orderbook.validate_buy_liquidity = lambda *_a, **_kw: (
+            [{"price": "0.49", "size": "100"}],
+            [{"price": "0.50", "size": "100"}])
+        trade.config.TRADE_LAST_SECONDS = 300
+        trade.config.MIN_SECONDS_TO_EXPIRY = 0
+        trade.set_order_observer(lambda _receipt: True)
+        trade._ambiguous_condition = None
+        trade._ambiguous_tokens = set()
+
+        # 1. an order the venue never fills
+        trade._client = _telemetry_client(
+            trade, {"success": True, "orderID": "oid-nofill",
+                    "status": "unmatched"})
+        trade.place_trade("UP", 2.0, up, down, condition, window_end)
+
+        # 2. an order whose submission raises
+        trade._client = _telemetry_client(
+            trade, None, raises=RuntimeError("transport timeout"))
+        trade.place_trade("UP", 2.0, up, down, condition, window_end)
+
+        # 3. an order blocked in preflight, before any network call
+        trade.orderbook.validate_buy_liquidity = (
+            lambda *_a, **_kw: (_ for _ in ()).throw(
+                ValueError("selected token has no asks")))
+        trade._client = _telemetry_client(
+            trade, {"success": True, "orderID": "oid-x", "status": "matched",
+                    "tradeIDs": ["t0"]})
+        trade.place_trade("UP", 2.0, up, down, condition, window_end)
+
+        rows = ([json.loads(line) for line in
+                 journal.read_text(encoding="utf-8").splitlines() if line.strip()]
+                if journal.exists() else [])
+    finally:
+        trade._client = saved["client"]
+        if saved["side"] is not None:
+            trade.Side = saved["side"]
+            trade.OrderType = saved["otype"]
+            trade.MarketOrderArgs = saved["moa"]
+            trade.PartialCreateOrderOptions = saved["pcoo"]
+        trade.orderbook.validate_buy_liquidity = saved["vbl"]
+        if saved["asset"] is not None:
+            trade.AssetType = saved["asset"]
+            trade.BalanceAllowanceParams = saved["bap"]
+        trade.config.TRADE_LAST_SECONDS = saved["last_secs"]
+        trade.config.MIN_SECONDS_TO_EXPIRY = saved["min_expiry"]
+        trade.set_order_observer(None)
+        trade._ambiguous_condition = saved["ambig_cond"]
+        trade._ambiguous_tokens = saved["ambig_tokens"]
+        if saved["env"] is None:
+            os.environ.pop("LIVE_ATTEMPTS_PATH", None)
+        else:
+            os.environ["LIVE_ATTEMPTS_PATH"] = saved["env"]
+
+    by_event = {}
+    for r in rows:
+        by_event.setdefault(r.get("event"), []).append(r)
+    check("a zero-fill order is recorded as an attempt",
+          len(by_event.get("attempt", [])) >= 1, str(sorted(by_event)))
+    check("its submissions are recorded even though nothing filled",
+          any(r.get("final_status") == "REJECTED"
+              for r in by_event.get("post", [])), str(by_event.get("post")))
+    check("a submission that raised is recorded, not lost",
+          any(r.get("final_status") == "SUBMIT_FAILED"
+              for r in by_event.get("post", [])), str(by_event.get("post")))
+    check("an order blocked in preflight still appears",
+          len(by_event.get("blocked", [])) == 1, str(by_event.get("blocked")))
+    attempt = (by_event.get("attempt") or [{}])[0]
+    for field in ("attempt_id", "best_bid", "best_ask", "spread",
+                  "requested_notional", "limit_price", "expected_shares",
+                  "expected_vwap", "expected_fee", "order_type"):
+        check(f"the attempt row carries {field}",
+              attempt.get(field) is not None, str(attempt))
+    ids = {r.get("attempt_id") for r in rows}
+    check("each intended order gets its own attempt id",
+          len(ids) == 3 and None not in ids, str(ids))
+    posts = by_event.get("post", [])
+    first_attempt_id = attempt.get("attempt_id")
+    check("post events join back to their attempt by attempt_id",
+          any(r.get("attempt_id") == first_attempt_id for r in posts),
+          str(posts[:2]))
+
+
+def t_paper_and_live_price_a_complement_from_the_same_interface():
+    """Same confirmed fills + same book + same config => same decision.
+
+    LIVE used to have no per-leg cost basis at all, so it refused every
+    complement while PAPER priced them - the two modes made different
+    decisions from the same information. Both now read open_leg_basis, which
+    is derived only from CONFIRMED lots, so only the data source differs.
+    """
+    import tempfile
+    import main_bot
+    from accounting.ledger import Ledger
+
+    condition, token = "0x" + "c" * 64, "777"
+    saved = main_bot._round_leg_basis_provider
+    decisions = {}
+    try:
+        for label, source in (("paper", "paper_live_book"), ("live", "user_ws")):
+            tmp = tempfile.mkdtemp()
+            ledger = Ledger(path=str(pathlib.Path(tmp) / "ledger.json"))
+            # Identical authoritative fills, recorded the way each mode
+            # records them.
+            ledger.record_fill_durable(
+                f"{label}-1", token, shares=10.0, price=0.40, side="BUY",
+                condition_id=condition, status="CONFIRMED", source=source,
+                fee=0.168)
+            main_bot._round_leg_basis_provider = (
+                lambda c, t, _l=ledger: _l.open_leg_basis(c, t))
+            decisions[label] = [
+                main_bot._pair_profit_guard(condition, token, ask)[0]
+                for ask in (0.30, 0.45, 0.58, 0.70)]
+    finally:
+        main_bot._round_leg_basis_provider = saved
+
+    check("PAPER and LIVE reach the same complement decisions",
+          decisions.get("paper") == decisions.get("live"), str(decisions))
+    check("and those decisions are not vacuous - cheap allowed, dear refused",
+          decisions.get("paper") == [True, True, False, False],
+          str(decisions.get("paper")))
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

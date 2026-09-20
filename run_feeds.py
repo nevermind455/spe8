@@ -716,6 +716,16 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
                         fee_resolver=polymarket_trade.market_fee_parameters,
                         allow_sells=config.STOP_LOSS_ENABLED)
 
+        # Finding 4. Positions are built only from CONFIRMED lots
+        # (Ledger.COUNTED_STATUSES), which in LIVE arrive from the private
+        # fill stream and REST reconcile - authoritative fills, never
+        # authorized or requested quantity. open_leg_basis reads those same
+        # positions, so LIVE can answer "what did this leg cost" exactly as
+        # PAPER does. Both modes now price a complement through one interface
+        # with identical logic and only the data source differs.
+        main_bot._round_leg_basis_provider = (
+            lambda condition, token: ledger.open_leg_basis(condition, token))
+
         def journal_live_order(receipt: dict) -> bool:
             order_id = receipt.get("order_id")
             ledger.authorize_order(

@@ -274,6 +274,98 @@ def fill_delay_section(journal: pathlib.Path, pos: dict) -> None:
         print("   fills lose the winners - the adverse selection live showed.")
 
 
+def attempts_section(path: pathlib.Path, orders: dict) -> None:
+    """What LIVE actually did with every intended order.
+
+    The ledger journals only orders that matched, so orders that were
+    rejected or never filled left no trace and the live fill rate was
+    unknowable. This reads the append-only attempt journal and joins the
+    accepted ones to the confirmed lots by order id, which is the first time
+    expected-vs-actual execution can be compared at all.
+    """
+    if not path.is_file():
+        return
+    events = collections.defaultdict(list)
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("attempt_id"):
+            events[row["attempt_id"]].append(row)
+    if not events:
+        return
+
+    outcome = collections.Counter()
+    posts, fill_lat = [], []
+    px_err, qty_err = [], []
+    for aid, rows in events.items():
+        attempt = next((r for r in rows if r.get("event") == "attempt"), None)
+        blocked = any(r.get("event") == "blocked" for r in rows)
+        post_rows = [r for r in rows if r.get("event") == "post"]
+        posts += [float(r["post_seconds"]) for r in post_rows
+                  if isinstance(r.get("post_seconds"), (int, float))]
+        if blocked:
+            outcome["blocked before submission"] += 1
+            continue
+        accepted = [r for r in post_rows if r.get("final_status") == "ACCEPTED"]
+        if not post_rows:
+            outcome["no submission recorded"] += 1
+            continue
+        if any(r.get("final_status") == "SUBMIT_FAILED" for r in post_rows):
+            outcome["submission failed"] += 1
+            continue
+        if not accepted:
+            outcome["submitted, never filled"] += 1
+            continue
+        oid = accepted[-1].get("order_id")
+        got = orders.get(oid)
+        if not got or got.get("sh", 0) <= 0:
+            outcome["accepted, no confirmed fill"] += 1
+            continue
+        outcome["filled"] += 1
+        if attempt:
+            exp_sh = attempt.get("expected_shares")
+            exp_px = attempt.get("expected_vwap")
+            if exp_sh:
+                qty_err.append(got["sh"] / float(exp_sh) - 1.0)
+            if exp_px and got["sh"] > 0:
+                px_err.append(got["notional"] / got["sh"] - float(exp_px))
+            first_post = min((float(r["submitted_wall"]) for r in post_rows
+                              if isinstance(r.get("submitted_wall"), (int, float))),
+                             default=None)
+            if first_post is not None and got.get("wall"):
+                fill_lat.append(got["wall"] - first_post)
+
+    total = sum(outcome.values())
+    print(f"\nATTEMPTS    {total} intended live orders "
+          f"({len(events)} journalled)")
+    for name, n in outcome.most_common():
+        print(f"            {name:<32}{n:>5}  {n / total * 100:>5.1f}%")
+    filled = outcome.get("filled", 0)
+    print(f"            LIVE FILL RATE {filled / total * 100:.1f}%"
+          f"  - the number PAPER has to reproduce")
+
+    def q(xs, frac):
+        return sorted(xs)[min(len(xs) - 1, int(len(xs) * frac))]
+
+    if posts:
+        print(f"            POST latency   p50 {statistics.median(posts):.3f}s"
+              f"   p95 {q(posts, 0.95):.3f}s   p99 {q(posts, 0.99):.3f}s")
+    if fill_lat:
+        print(f"            submit->fill   p50 {statistics.median(fill_lat):.1f}s"
+              f"   p95 {q(fill_lat, 0.95):.1f}s")
+    if px_err:
+        ticks = [e / 0.01 for e in px_err]
+        print(f"            VWAP error vs the book it saw: median "
+              f"{statistics.median(px_err):+.4f} ({statistics.median(ticks):+.1f} ticks)")
+    if qty_err:
+        print(f"            filled quantity vs expected: median "
+              f"{statistics.median(qty_err) * 100:+.1f}%")
+    print("            Compare LIVE FILL RATE with the paper report's")
+    print("            paper_filled share before trusting any paper P&L.")
+
+
 def live_timing_section(path: pathlib.Path, orders: dict) -> None:
     """Real POST -> venue response -> fill confirmation times, per order."""
     if not path.is_file():
@@ -659,6 +751,7 @@ def live_report(base: pathlib.Path) -> int:
               f"   {sig(total['n'], win, avg_px)}")
     print_bands(bands)
     pairs_section(held)
+    attempts_section(path("LIVE_ATTEMPTS_PATH", "live_attempts.jsonl"), orders)
     live_timing_section(
         path("LIVE_FILL_TIMING_PATH", "live_fill_timing.jsonl"), orders)
     settlement_section(pos)
