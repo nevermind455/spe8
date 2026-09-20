@@ -891,7 +891,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # config.py re-approved 2026-09-22: PAPER_ADVERSE_FILL_TICKS models the
     # paper-to-live leak - paper filled whenever the book allowed, live only
     # when the offer survived the round trip. PAPER-side only.
-    "config.py": "606124c09e200cd7f4689a71dad08517f5035f7b59d5a110d477691b16a17396",
+    # config.py re-approved 2026-09-23: PAPER_ADVERSE_FILL_TICKS removed. It
+    # refused a fill when the ask ticked up, which is not what a FOK does -
+    # a signed order fills at any price up to its limit. Paper now aligns on
+    # the price limit and a stake fixed before the delay, as live does.
+    "config.py": "ceaf2a7db0af1f711193c5de2cd0fc685f59ce3c97b09984a679336b9dc77ac3",
 }
 
 

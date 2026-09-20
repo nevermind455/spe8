@@ -208,30 +208,6 @@ def _delay_probes(name: str) -> tuple[float, ...]:
 # as <audit stem>_fill_delay.jsonl.
 PAPER_FILL_DELAY_PROBES = _delay_probes("PAPER_FILL_DELAY_PROBES")
 
-# ---- the paper-to-live leak ------------------------------------------------
-# Paper fills whenever the book can satisfy the order. Live fills only when a
-# counterparty is still willing to sell at that price when the order lands -
-# and the moments an offer VANISHES are the moments the price is about to move
-# your way, because faster participants lift it first. What remains is what
-# someone is happy to sell you. So live's fills are adversely selected and
-# paper's are not, which is why the same strategy shows profit in paper and
-# loses live.
-#
-# Measured in this bot's own probe data: orders that would have MISSED at a
-# 1s delay won 59.3% against 52.3% for the ones that filled - the misses were
-# 7 points more likely to be winners.
-#
-# The model, which needs no knowledge of the future: re-read the book after
-# the modelled latency and refuse the fill when the ask has RISEN by this many
-# ticks, i.e. the offer we aimed at was taken while our order was in flight.
-# A falling ask still fills - that is the adverse half, and live gets it too.
-#
-# 0 disables it and restores the old optimistic behaviour. This is a MODEL of
-# live, not a measurement of it: validate it against a live sample before
-# trusting a paper P&L produced with it.
-PAPER_ADVERSE_FILL_TICKS = _env_float("PAPER_ADVERSE_FILL_TICKS", "1")
-if not 0 <= PAPER_ADVERSE_FILL_TICKS <= 10:
-    raise ValueError("PAPER_ADVERSE_FILL_TICKS must be between 0 and 10")
 TWAP_STALE_AFTER = _env_float("TWAP_STALE_AFTER", "10.0")
 # No order inside the final minute. Measured over 16 fills: 31.2% won against
 # a 69.6% break-even, z = -3.29 - and it has a mechanism, not just a p-value.
@@ -911,7 +887,6 @@ PARITY_CLASSES = {
     ),
     "EXECUTION MODEL": (
         ("PAPER_LATENCY_MS", None),
-        ("PAPER_ADVERSE_FILL_TICKS", None),
         ("ASSUMED_MATCH_DELAY_SECONDS", None),
     ),
     "SAFETY": (

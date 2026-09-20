@@ -619,7 +619,6 @@ class PaperBroker:
         trade_window_seconds: float = 60.0,
         on_event=None,
         fill_delay_probes: tuple = (),
-        adverse_fill_ticks: float = 0.0,
         probe_scheduler: Callable[[float, Callable[[], None]], None] | None = None,
     ) -> None:
         self.ledger = ledger
@@ -643,11 +642,6 @@ class PaperBroker:
                 or not self.min_seconds_to_expiry < self.trade_window_seconds <= 300
                 or not 0 <= self.min_buy_price < self.max_buy_price < 1):
             raise ValueError("invalid paper latency/book-age/spread configuration")
-        self.adverse_fill_ticks = float(adverse_fill_ticks or 0.0)
-        if not 0 <= self.adverse_fill_ticks <= 10:
-            raise ValueError("adverse fill ticks must be between 0 and 10")
-        # Counted so a session can report how often live would have missed.
-        self.adverse_misses = 0
         self.fill_delay_probes = tuple(float(d) for d in (fill_delay_probes or ()))
         if any(not math.isfinite(d) or not 0 < d <= 60 for d in self.fill_delay_probes):
             raise ValueError("fill delay probes must be between 0 and 60 seconds")
@@ -1067,19 +1061,39 @@ class PaperBroker:
             cutoff = end - self.min_seconds_to_expiry
             if timer.unix() + assumed_latency_ms / 1000.0 >= cutoff:
                 raise PaperRejected("not enough time remaining for paper latency before cutoff")
-            # The ask we aimed at, before the order is "in flight". Compared
-            # with the ask on arrival below to decide whether the offer was
-            # still there - see config.PAPER_ADVERSE_FILL_TICKS.
-            pre_ask = None
-            if self.adverse_fill_ticks and assumed_latency_ms:
-                try:
-                    pre_book = self._book_fetch(str(token_id))
-                    if isinstance(pre_book, BookSnapshot) and pre_book.asks:
-                        pre_ask = Decimal(str(pre_book.asks[0][0]))
-                except Exception:
-                    # An unreadable pre-book must not decide the fill either
-                    # way; fall through and let the normal checks run.
-                    pre_ask = None
+            # An order-level cap may tighten the account ceiling but never
+            # loosen it: a caller cannot buy above what the account allows.
+            cap = self.max_buy_price
+            if max_price is not None:
+                cap = min(cap, float(max_price))
+                if cap <= self.min_buy_price:
+                    raise PaperRejected(
+                        f"order price cap {cap} is at or below the floor "
+                        f"{self.min_buy_price}")
+            floor = self.min_buy_price
+            if min_price is not None:
+                # Raise only, mirroring the cap's tighten-only rule.
+                floor = max(floor, Decimal(str(min_price)))
+
+            # THE STAKE IS FIXED HERE, from the book as it is at the decision,
+            # because that is when a live order's size is fixed too: live
+            # sizes and signs in preflight and cannot revise the amount once
+            # the order is in flight. Sizing after the delay let paper choose
+            # its stake against the very book it was about to fill on, which
+            # is information a real order never has.
+            decision_book = self._book_fetch(str(token_id))
+            if not isinstance(decision_book, BookSnapshot):
+                raise PaperRejected("invalid public order book response")
+            if not decision_book.asks:
+                raise PaperRejected(
+                    f"cannot FOK buy {side}: no asks on the live book "
+                    "(liquidity pulled or one-sided)")
+            spend = size_to_venue_minimum(amount, decision_book, rules, cap)
+            if spend > Decimal(str(amount)):
+                print(
+                    f"[PAPER] Sizing ${float(amount):.2f} up to ${float(spend):.2f} "
+                    f"to meet the venue minimum"
+                )
             if assumed_latency_ms:
                 time.sleep(assumed_latency_ms / 1000.0)
             if timer.unix() >= cutoff:
@@ -1117,19 +1131,6 @@ class PaperBroker:
                 raise PaperRejected(
                     f"cannot FOK buy {side}: no asks on the live book "
                     "(liquidity pulled or one-sided)")
-            if pre_ask is not None:
-                # The offer moved up while the order was in flight: in live
-                # someone faster took it and the fill does not happen. Paper
-                # used to take it anyway at the new price, which is the single
-                # biggest reason a profitable paper run loses money live.
-                tick = rules.tick_size or Decimal("0.01")
-                moved = Decimal(str(book.asks[0][0])) - pre_ask
-                if moved >= tick * Decimal(str(self.adverse_fill_ticks)):
-                    self.adverse_misses += 1
-                    raise PaperRejected(
-                        f"offer lifted while the order was in flight: ask "
-                        f"{pre_ask} -> {book.asks[0][0]} in "
-                        f"{assumed_latency_ms:.0f}ms")
             # A real executable spread requires both sides of the same,
             # timestamped venue snapshot.
             best_bid = book.best_bid
@@ -1139,25 +1140,10 @@ class PaperBroker:
             if spread > Decimal(str(self.max_spread)):
                 raise PaperRejected(
                     f"spread {spread:.6f} exceeds paper limit {self.max_spread:.6f}")
-            # An order-level cap may tighten the account ceiling but never
-            # loosen it: a caller cannot buy above what the account allows.
-            cap = self.max_buy_price
-            if max_price is not None:
-                cap = min(cap, float(max_price))
-                if cap <= self.min_buy_price:
-                    raise PaperRejected(
-                        f"order price cap {cap} is at or below the floor "
-                        f"{self.min_buy_price}")
-            spend = size_to_venue_minimum(amount, book, rules, cap)
-            if spend > Decimal(str(amount)):
-                print(
-                    f"[PAPER] Sizing ${float(amount):.2f} up to ${float(spend):.2f} "
-                    f"to meet the venue minimum"
-                )
-            floor = self.min_buy_price
-            if min_price is not None:
-                # Raise only, mirroring the cap's tighten-only rule.
-                floor = max(floor, Decimal(str(min_price)))
+            # The fixed stake meets the arrival book. Whether the ask rose
+            # or fell in between decides only the price paid: a FOK fills at
+            # any price up to the cap and refuses past it, which is exactly
+            # what the venue does with a signed limit order.
             quote = estimate_fok(book, spend, cap, rules, min_price=floor)
             if timer.unix() >= end - self.min_seconds_to_expiry:
                 raise PaperRejected("paper quote reached the round cutoff")
