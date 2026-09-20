@@ -92,26 +92,49 @@ def et(wall) -> str:
 def sig(n: int, win: float, px: float) -> str:
     """z and two-sided p for EDGE = win - px, or a refusal to pretend.
 
-    Normal approximation to the binomial. Below 30 fills it is not worth
-    printing a number at all - that is where every retracted result came from.
+    `n` must be the number of INDEPENDENT observations - rounds, not fills.
+    Several fills in one 5-minute round all bet on the same outcome, so
+    counting them separately overstates confidence by about the square root
+    of the fills per round.
+
+    Two refusals, both of which this file has already been burned by:
+
+    Below 30 observations no number is worth printing; that is where every
+    retracted result in this repo came from.
+
+    At a win rate of exactly 0 or 1 the binomial variance is zero and the
+    normal approximation does not apply. Clamping the variance to an epsilon
+    produced z = +33,760 on 51 fills - an artefact of dividing by 1e-9, which
+    reads as overwhelming proof and is nothing of the kind.
     """
     if n < 30:
-        return "  n<30  noise"
-    var = max(win * (1.0 - win), 1e-9)
+        return f" {n:>4} rnds noise"
+    if win <= 0.0 or win >= 1.0:
+        return "  0%/100% n/a"
+    var = win * (1.0 - win)
     z = (win - px) / math.sqrt(var / n)
     p = math.erfc(abs(z) / math.sqrt(2.0))
     return f"{z:+6.2f} p={p:.3f}"
 
 
 def new_bucket() -> dict:
-    return {"n": 0, "cost": 0.0, "pay": 0.0, "px": 0.0, "won": 0}
+    # "rounds" holds the distinct 5-minute windows that contributed. It is
+    # the sample size for significance; "n" only counts orders.
+    return {"n": 0, "cost": 0.0, "pay": 0.0, "px": 0.0, "won": 0,
+            "rounds": set()}
+
+
+def bucket_rounds(bucket: dict) -> int:
+    """Independent observations in a bucket: rounds, falling back to fills."""
+    rounds = bucket.get("rounds")
+    return len(rounds) if rounds else bucket["n"]
 
 
 def print_bands(bands: dict) -> None:
     if not bands:
         return
-    print(f"\n{'PRICE BAND':<12}{'fills':>6}{'avg px':>8}{'cost':>10}"
-          f"{'P&L':>10}{'return':>9}{'won':>7}{'EDGE':>8}{'fee':>7}"
+    print(f"\n{'PRICE BAND':<12}{'fills':>6}{'rnds':>6}{'avg px':>8}{'cost':>9}"
+          f"{'P&L':>9}{'return':>8}{'won':>6}{'EDGE':>8}{'fee':>6}"
           f"{'z / p':>15}")
     for band in BAND_ORDER:
         b = bands.get(band)
@@ -124,11 +147,14 @@ def print_bands(bands: dict) -> None:
         # fill costs MORE in fees than an expensive one. Shown beside the
         # edge because it is what the edge has to clear.
         fee = 0.07 * (1 - avg_px)
-        print(f"{band:<12}{b['n']:>6}{avg_px:>8.3f}{b['cost']:>10.2f}"
-              f"{pnl:>+10.2f}{pnl / b['cost'] * 100:>8.1f}%"
-              f"{win * 100:>6.0f}%{win - avg_px:>+8.3f}{fee * 100:>6.1f}%"
-              f"  {sig(b['n'], win, avg_px)}")
+        print(f"{band:<12}{b['n']:>6}{bucket_rounds(b):>6}{avg_px:>8.3f}"
+              f"{b['cost']:>9.2f}{pnl:>+9.2f}"
+              f"{pnl / b['cost'] * 100:>7.1f}%"
+              f"{win * 100:>5.0f}%{win - avg_px:>+8.3f}{fee * 100:>5.1f}%"
+              f"  {sig(bucket_rounds(b), win, avg_px)}")
     print("   EDGE is gross of fees; the fee column is what it must clear.")
+    print("   z is computed on ROUNDS, not fills: several fills in one round")
+    print("   bet on one outcome, so fills overstate confidence by ~sqrt(per).")
     print("   Ignore any row that is not significant, however good it looks.")
 
 
@@ -689,6 +715,7 @@ def paper_report(base: pathlib.Path) -> int:
         pay = o["shares"] * (q.get("payout_per_share") or 0.0)
         px = o["average_price"]
         for bucket in (legs[leg], bands[band_of(px)]):
+            bucket["rounds"].add(timer.window_start(o["wall"]))
             bucket["n"] += 1
             bucket["cost"] += o["total_cost"]
             bucket["pay"] += pay
@@ -696,8 +723,8 @@ def paper_report(base: pathlib.Path) -> int:
             bucket["won"] += (pay > 0)
 
     if legs:
-        print(f"\n{'LEG':<9}{'fills':>6}{'avg px':>8}{'cost':>10}{'P&L':>10}"
-              f"{'return':>9}{'won':>7}{'EDGE':>8}{'z / p':>15}")
+        print(f"\n{'LEG':<9}{'fills':>6}{'rnds':>6}{'avg px':>8}{'cost':>9}"
+              f"{'P&L':>9}{'return':>8}{'won':>6}{'EDGE':>8}{'z / p':>15}")
         for k in ("PRIMARY", "HEDGE"):
             d = legs.get(k)
             if not d or not d["n"] or not d["cost"]:
@@ -944,6 +971,7 @@ def live_report(base: pathlib.Path) -> int:
         px = o["notional"] / o["sh"]
         paid = float(q.get("payout_per_share") or 0.0)
         for bucket in (bands[band_of(px)], total):
+            bucket["rounds"].add(timer.window_start(o["wall"]))
             bucket["n"] += 1
             bucket["cost"] += o["notional"] + o["fee"]
             bucket["pay"] += o["sh"] * paid

@@ -3386,6 +3386,42 @@ def t_book_age_is_measured_from_one_clock_or_not_at_all():
         trade.book_meta_provider = saved
 
 
+def t_significance_refuses_what_the_normal_approximation_cannot_answer():
+    """Two ways this report has claimed proof it did not have.
+
+    A 100% win rate makes the binomial variance zero. Clamping it to 1e-9
+    produced z = +33,760 on 51 fills - a division by an epsilon that reads as
+    overwhelming evidence.
+
+    And fills are not independent observations: several fills in one round
+    bet on one outcome, so testing on fills overstates confidence by about
+    the square root of the fills per round.
+    """
+    import analyze_session as A
+
+    check("a 100% win rate refuses a z score",
+          "n/a" in A.sig(51, 1.0, 0.851), A.sig(51, 1.0, 0.851))
+    check("a 0% win rate refuses a z score",
+          "n/a" in A.sig(40, 0.0, 0.25), A.sig(40, 0.0, 0.25))
+    check("a real rate still gets a number",
+          "p=" in A.sig(40, 0.60, 0.55), A.sig(40, 0.60, 0.55))
+    check("below 30 observations it reports the sample, not a z",
+          "noise" in A.sig(24, 0.917, 0.711) and "24" in A.sig(24, 0.917, 0.711),
+          A.sig(24, 0.917, 0.711))
+
+    bucket = A.new_bucket()
+    check("a fresh bucket counts rounds separately from fills",
+          bucket["rounds"] == set() and bucket["n"] == 0, str(bucket))
+    bucket["n"] = 213
+    bucket["rounds"] = {1, 2, 3}
+    check("the sample size is rounds when rounds are known",
+          A.bucket_rounds(bucket) == 3, str(A.bucket_rounds(bucket)))
+    empty = A.new_bucket()
+    empty["n"] = 5
+    check("with no round information it falls back to fills, not to zero",
+          A.bucket_rounds(empty) == 5, str(A.bucket_rounds(empty)))
+
+
 def main():
     # A crashing test must be one failure, not a suite that stops reporting.
     def run(fn, is_async=False):
