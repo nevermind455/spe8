@@ -685,6 +685,8 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
             # Diagnostic book re-reads after each fill; empty by default. See
             # config.PAPER_FILL_DELAY_PROBES.
             fill_delay_probes=config.PAPER_FILL_DELAY_PROBES,
+            # Models live's adverse selection; see the config comment.
+            adverse_fill_ticks=config.PAPER_ADVERSE_FILL_TICKS,
             book_fetch=lambda token: fetch_executable_book(
                 token, host=config.CLOB_HOST, ws_view=hub.book.view(str(token))),
             on_event=on_event,

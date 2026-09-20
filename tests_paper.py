@@ -1107,6 +1107,72 @@ def t_live_fill_timing_journal_records_post_and_response():
     check("an unwritable journal never raises into the order path", swallowed)
 
 
+def _book_at(best, token="up"):
+    """A one-level book at ``best`` so a fill's price is unambiguous."""
+    return BookSnapshot(
+        token, ((D(str(best)), D("50")),),
+        min_order_size=None, tick_size=D("0.01"),
+        timestamp=str(int(time.time() * 1000)), book_hash="abc",
+        received_wall=time.time(), best_bid=D(str(round(best - 0.01, 2))))
+
+
+def _inflight_broker(tmp, books, ticks=1.0):
+    tmp = pathlib.Path(tmp)
+    ledger = Ledger(path=str(tmp / "paper_ledger.json"))
+    return PaperBroker(
+        ledger,
+        market_context=lambda: {"condition_id": "cond", "up_token_id": "up",
+                                "down_token_id": "down"},
+        host="https://public.invalid", max_buy_price=.99, start_balance=100,
+        account_path=tmp / "paper_account.json",
+        audit_path=tmp / "paper_orders.jsonl",
+        book_fetch=lambda _token: books.pop(0) if books else _book_at(0.40),
+        rules_fetch=lambda _cid: rules(),
+        min_seconds_to_expiry=0, trade_window_seconds=300,
+        latency_ms=1.0, adverse_fill_ticks=ticks)
+
+
+def t_paper_refuses_a_fill_whose_offer_was_lifted_in_flight():
+    """Paper must miss the fills live misses, or its P&L cannot predict live.
+
+    Paper filled whenever the book could satisfy the order. Live fills only
+    when someone is still willing to sell when the order lands, and an offer
+    disappears precisely when the price is about to move your way. That
+    asymmetry - not the signal - is why a profitable paper run loses live:
+    this bot's own probes measured orders that would have missed at a 1s delay
+    winning 59.3% against 52.3% for the ones that filled.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        lifted = _inflight_broker(tmp, [_book_at(0.40), _book_at(0.41)])
+        filled = paper_order(lifted, amount=2)
+        check("a fill whose offer was lifted in flight is refused",
+              filled is False, str(lifted.last_error))
+        check("the reason names the lift, not a generic reject",
+              "lifted" in (lifted.last_error or ""), str(lifted.last_error))
+        check("and it is counted for the session report",
+              lifted.adverse_misses == 1, str(lifted.adverse_misses))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        steady = _inflight_broker(tmp, [_book_at(0.40), _book_at(0.40)])
+        check("an unchanged offer still fills", paper_order(steady, amount=2),
+              str(steady.last_error))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # The adverse half: the price moved AGAINST the position, the offer is
+        # still there, and live would fill it too. Paper must not get to skip
+        # the bad fills while keeping the good ones.
+        sinking = _inflight_broker(tmp, [_book_at(0.40), _book_at(0.39)])
+        check("a falling offer still fills - that is the adverse half",
+              paper_order(sinking, amount=2), str(sinking.last_error))
+        check("a fill on a falling offer is not counted as a miss",
+              sinking.adverse_misses == 0, str(sinking.adverse_misses))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        off = _inflight_broker(tmp, [_book_at(0.40), _book_at(0.45)], ticks=0)
+        check("setting 0 ticks restores the old optimistic behaviour",
+              paper_order(off, amount=2), str(off.last_error))
+
+
 def main() -> int:
     for name, test in sorted(globals().items()):
         if not name.startswith("t_") or not callable(test):

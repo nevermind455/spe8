@@ -878,7 +878,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # config.py re-approved 2026-09-22: POSITION_SIZING/kelly_stake added.
     # Sizing only; default stays 'fixed' and kelly refuses any band without
     # a measured positive edge, so no path changes unless asked.
-    "config.py": "a7555c58831d5dd06ab5f3e6eb129991700e91499709df8749d7949638dd4a4e",
+    # config.py re-approved 2026-09-22: PAPER_ADVERSE_FILL_TICKS models the
+    # paper-to-live leak - paper filled whenever the book allowed, live only
+    # when the offer survived the round trip. PAPER-side only.
+    "config.py": "fa3d2287a8d26ac86992b93d23673426fffaeede6aab8ebf40a11590c45fa2c7",
 }
 
 
