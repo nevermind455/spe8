@@ -665,6 +665,117 @@ def entry_cost_ceiling(cap_price: float, amount: float | None = None) -> float:
     return notional * (1.0 + TAKER_FEE_RATE)
 
 
+def _kelly_bands(name: str):
+    """Per-price-band edge estimates, "lo:hi:edge" comma separated.
+
+    Edge is in probability points: 0.03 means "this band wins 3 points more
+    often than its price implies". A band may be given a NEGATIVE edge, or
+    left out entirely; either way Kelly refuses to bet there, which is the
+    whole point - the sizing rule should decline the bands that lose.
+    """
+    raw = (_env_text(name, "") or "").strip()
+    if not raw:
+        return ()
+    out = []
+    for piece in raw.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        parts = piece.split(":")
+        if len(parts) != 3:
+            raise ValueError(f"{name} entries must be lo:hi:edge, got {piece!r}")
+        try:
+            lo, hi, edge = (float(x) for x in parts)
+        except ValueError:
+            raise ValueError(f"{name} entries must be numbers, got {piece!r}")
+        if not 0 <= lo < hi <= 1:
+            raise ValueError(f"{name} needs 0 <= lo < hi <= 1, got {piece!r}")
+        if not -1 <= edge <= 1 or not math.isfinite(edge):
+            raise ValueError(f"{name} edge must be between -1 and 1, got {piece!r}")
+        out.append((lo, hi, edge))
+    out.sort()
+    for (_lo1, hi1, _e1), (lo2, _hi2, _e2) in zip(out, out[1:]):
+        if lo2 < hi1:
+            raise ValueError(f"{name} bands overlap at {lo2}")
+    return tuple(out)
+
+
+# ---- position sizing -------------------------------------------------------
+# "fixed" stakes BET_SIZE every time. "kelly" sizes from a measured edge.
+#
+# Kelly stakes f = (w - p) / (1 - p) of bankroll, which with a CONSTANT edge
+# e = w - p becomes f = e / (1 - p) - seven times more at 0.90 than at 0.30,
+# because the payoff per dollar shrinks as the price rises. That is the
+# "bet more when confident" rule wearing a formula, and it points capital at
+# exactly the bands this bot measured worst (0.70-0.80 at -0.118, >=0.80 at
+# -0.108, against +0.057 and +0.054 in the cheap bands). So the edge here is
+# NOT a constant: it is per band, from measurement, and a band with no entry
+# or a non-positive edge is refused rather than sized.
+POSITION_SIZING = (_env_text("POSITION_SIZING", "fixed") or "fixed").strip().lower()
+if POSITION_SIZING not in ("fixed", "kelly"):
+    raise ValueError("POSITION_SIZING must be 'fixed' or 'kelly'")
+
+# Fraction of full Kelly. Full Kelly is optimal only when the edge is known
+# exactly; every edge here is an estimate from a few hundred fills, and
+# over-betting an over-estimated edge is how bankrolls die. Quarter Kelly is
+# the usual answer to estimation error.
+KELLY_FRACTION = _env_float("KELLY_FRACTION", "0.25")
+# Hard ceiling as a share of bankroll, whatever the formula asks for.
+KELLY_MAX_STAKE_PCT = _env_float("KELLY_MAX_STAKE_PCT", "0.02")
+KELLY_MIN_STAKE = _env_float("KELLY_MIN_STAKE", "1.00")
+KELLY_EDGE_BANDS = _kelly_bands("KELLY_EDGE_BANDS")
+if not 0 < KELLY_FRACTION <= 1:
+    raise ValueError("KELLY_FRACTION must be above 0 and at most 1")
+if not 0 < KELLY_MAX_STAKE_PCT <= 0.25:
+    raise ValueError("KELLY_MAX_STAKE_PCT must be above 0 and at most 0.25")
+if not KELLY_MIN_STAKE > 0:
+    raise ValueError("KELLY_MIN_STAKE must be positive")
+if POSITION_SIZING == "kelly" and not KELLY_EDGE_BANDS:
+    raise ValueError(
+        "POSITION_SIZING=kelly needs KELLY_EDGE_BANDS; sizing from an edge "
+        "nobody measured is how a losing strategy gets leveraged")
+
+
+def kelly_edge_for(price: float) -> float | None:
+    """The configured edge for this price, or None if no band covers it."""
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return None
+    for lo, hi, edge in KELLY_EDGE_BANDS:
+        if lo <= p < hi:
+            return edge
+    return None
+
+
+def kelly_stake(price: float, bankroll: float) -> float | None:
+    """What to stake at this price, or None when the answer is "do not bet".
+
+    None is returned for a band with no measured edge, a non-positive edge,
+    and - importantly - when the stake Kelly wants is below what the venue
+    will actually let you buy. The venue's 5-share minimum costs
+    5 * price, so a small bankroll asking for $2 at 0.90 would be forced to
+    stake $4.50: over-betting by more than double. Refusing is the honest
+    answer, and it makes the rule decline expensive contracts automatically
+    as the bankroll shrinks.
+    """
+    try:
+        p, bank = float(price), float(bankroll)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < p < 1 or not math.isfinite(bank) or bank <= 0:
+        return None
+    edge = kelly_edge_for(p)
+    if edge is None or edge <= 0:
+        return None
+    fraction = min(KELLY_FRACTION * edge / (1.0 - p), KELLY_MAX_STAKE_PCT)
+    stake = bank * fraction
+    floor = max(KELLY_MIN_STAKE, VENUE_MIN_SHARES * p)
+    if stake + 1e-9 < floor:
+        return None
+    return round(stake, 2)
+
+
 def _round_entry_budget() -> float:
     """Worst-case CASH for one round, counting only the phases switched on.
 

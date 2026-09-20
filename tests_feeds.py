@@ -1698,7 +1698,10 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     "market_discovery.py": "23c605f678eaf1c6caf60259293b9bccf73413e7f632c0a6749c55acc571aa11",
     "price_ws.py": "0dc5e08fede52b8ec20d60cca83c6811baa811832d711f4c8236cf6128b628c7",
     "timer.py": "3ca35cc64539d45f7e4b982cbe9b6153138f87ee1be79adfae0c8eaccc875d50",
-    "config.py": "bbf558ea39d67f4879bbf576d07f77d2160f66fd3ff0a3102a8fc1d562d598e8",
+    # config.py re-approved 2026-09-22: POSITION_SIZING/kelly_stake added.
+    # Sizing only; default stays 'fixed' and kelly refuses any band without
+    # a measured positive edge, so no path changes unless asked.
+    "config.py": "ec1a963806a301c62e01ed46f1c0f30f1f3e4c30b2730f1401ff873c5c58cb6c",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

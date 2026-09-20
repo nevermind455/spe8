@@ -2265,6 +2265,104 @@ def t_entry_cost_ceiling_charges_what_the_slot_actually_stakes():
           f"{small} vs {base} - 5 shares at the cap is the real floor")
 
 
+def _with_config(env, fn):
+    """Run fn against config reloaded under env, then restore the real one."""
+    import importlib
+    import os
+    import config as cfg
+
+    saved = dict(os.environ)
+    try:
+        os.environ.update({k: str(v) for k, v in env.items()})
+        importlib.reload(cfg)
+        return fn(cfg)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        importlib.reload(cfg)
+
+
+MEASURED = {"POSITION_SIZING": "kelly",
+            "KELLY_EDGE_BANDS": "0.15:0.30:0.05,0.30:0.50:0.05,"
+                                "0.50:0.70:-0.05,0.70:0.90:-0.11"}
+
+
+def t_kelly_refuses_the_bands_that_lose():
+    """Kelly must decline a non-positive edge instead of sizing it.
+
+    The bot's measured edges are positive in the cheap bands and negative
+    from 0.50 up (-0.118 at 0.70-0.80). A sizing rule that bets anything at
+    all in those bands is amplifying a known loss.
+    """
+    def body(cfg):
+        cheap = cfg.kelly_stake(0.30, 300.0)
+        check("a positive-edge band is sized", cheap and cheap > 0, str(cheap))
+        for px in (0.55, 0.75, 0.85):
+            check(f"a negative-edge band at {px} is refused",
+                  cfg.kelly_stake(px, 300.0) is None, str(cfg.kelly_stake(px, 300.0)))
+        check("a price no band covers is refused",
+              cfg.kelly_stake(0.95, 300.0) is None, str(cfg.kelly_stake(0.95, 300.0)))
+        check("a bigger bankroll stakes more at the same price",
+              cfg.kelly_stake(0.30, 600.0) > cfg.kelly_stake(0.30, 300.0))
+    _with_config(MEASURED, body)
+
+
+def t_kelly_does_not_concentrate_capital_on_expensive_contracts():
+    """The constant-edge trap: f = e/(1-p) grows without bound as p -> 1.
+
+    With one edge applied everywhere, Kelly stakes seven times more at 0.90
+    than at 0.30 - pointing capital at the worst-measured band. The cap is
+    what stops that being unbounded, so pin it.
+    """
+    def body(cfg):
+        flat_cheap = cfg.kelly_stake(0.30, 300.0)
+        flat_dear = cfg.kelly_stake(0.88, 300.0)
+        check("a flat edge does stake more at a high price (the trap is real)",
+              flat_dear > flat_cheap, f"{flat_dear} vs {flat_cheap}")
+        ceiling = 300.0 * cfg.KELLY_MAX_STAKE_PCT
+        check("but the cap bounds it",
+              flat_dear <= ceiling + 1e-9, f"{flat_dear} > {ceiling}")
+    _with_config({"POSITION_SIZING": "kelly",
+                  "KELLY_EDGE_BANDS": "0.10:0.95:0.03"}, body)
+
+
+def t_kelly_refuses_when_the_venue_minimum_would_force_overbetting():
+    """Below the venue's 5-share minimum the stake is not the one Kelly chose.
+
+    Asking for $2 at 0.90 buys nothing: the venue's minimum costs $4.50, so
+    the order would silently stake more than double what the rule wanted.
+    """
+    def body(cfg):
+        small = cfg.kelly_stake(0.45, 40.0)
+        check("a bankroll too small to bet properly is refused",
+              small is None, str(small))
+        ok = cfg.kelly_stake(0.45, 3000.0)
+        check("the same price is sized once the bankroll supports it",
+              ok and ok >= cfg.VENUE_MIN_SHARES * 0.45, str(ok))
+    _with_config(MEASURED, body)
+
+
+def t_kelly_configuration_is_refused_when_it_cannot_be_trusted():
+    check("kelly without a measured edge table is refused",
+          "KELLY_EDGE_BANDS" in (_reload_config(POSITION_SIZING="kelly") or ""),
+          str(_reload_config(POSITION_SIZING="kelly")))
+    check("an unknown sizing mode is refused",
+          "POSITION_SIZING" in (_reload_config(POSITION_SIZING="martingale") or ""),
+          str(_reload_config(POSITION_SIZING="martingale")))
+    check("a malformed edge band is refused",
+          "lo:hi:edge" in (_reload_config(KELLY_EDGE_BANDS="0.3:0.5") or ""),
+          str(_reload_config(KELLY_EDGE_BANDS="0.3:0.5")))
+    check("overlapping edge bands are refused",
+          "overlap" in (_reload_config(
+              KELLY_EDGE_BANDS="0.10:0.40:0.05,0.30:0.60:0.02") or ""),
+          str(_reload_config(KELLY_EDGE_BANDS="0.10:0.40:0.05,0.30:0.60:0.02")))
+    check("over-betting beyond full Kelly is refused",
+          "KELLY_FRACTION" in (_reload_config(KELLY_FRACTION="2.0") or ""),
+          str(_reload_config(KELLY_FRACTION="2.0")))
+    check("sizing stays FIXED unless asked otherwise",
+          _reload_config() is None and __import__("config").POSITION_SIZING == "fixed")
+
+
 async def t_taper_hedge_leg_survives_a_stale_primary_side_liquidity_check():
     """A hedge leg must not die because the PRIMARY side's book blipped.
 
