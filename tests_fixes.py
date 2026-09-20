@@ -1127,7 +1127,8 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
                                   decision_rule=None, unsettled_provider=None,
                                   max_unsettled=0.0, require_unanimity=False,
                                   taper_advance=0, primary_slots=None,
-                                  primary_ladder=None, hedge_ladder=None):
+                                  primary_ladder=None, hedge_ladder=None,
+                                  leg_basis=(0.10, 0.001)):
     """Drive a forced DOWN signal through phase 2 after a restart."""
     import main_bot
 
@@ -1199,6 +1200,13 @@ async def _drive_phase2_with_hold(*, execution_mode, held_provider,
         replace(main_bot, "_round_exposure_provider",
                 lambda _window, _condition: 0.0)
         replace(main_bot, "_round_held_tokens_provider", held_provider)
+        # A complement purchase is priced against the held leg's real cost
+        # basis (config.COMPLEMENT_REQUIRES_PROFIT). These cases exercise
+        # signal-epoch and taper logic, not pair economics, so the held leg is
+        # cheap by default and the finished pair is comfortably profitable. A
+        # test that wants the guard to bite passes a dear basis instead.
+        replace(main_bot, "_round_leg_basis_provider",
+                (lambda _condition, _token: leg_basis) if leg_basis else None)
         replace(main_bot, "_execution_ready_provider",
                 execution_ready_provider or (lambda _condition: True))
         replace(main_bot, "_strike", Strike())
@@ -2416,6 +2424,44 @@ async def t_paper_signal_flip_mode_keeps_repeats_and_allows_verified_flip():
           flipped["order_sides"] == ["UP", "DOWN"], str(flipped))
     check("both accepted sides retain executor-side fresh-price guards",
           flipped["executor_guards"] == [True, True], str(flipped))
+
+
+async def t_complement_is_refused_when_the_finished_pair_cannot_pay():
+    """Every complement purchase must leave a pair that can still profit.
+
+    A matched UP+DOWN pair redeems exactly $1.00 however BTC moves, so a pair
+    costing more is a certain loss with no prediction involved. The paths that
+    buy a complement - a verified signal flip, a taper hedge slot - priced the
+    marginal order but never the finished position: measured on one paper
+    session, 72 of 89 completed pairs cost over $1.00, worst $1.3199, for
+    -$152.17 of certain loss. The guard sits at the submit choke point so it
+    catches whichever path chose the leg.
+    """
+    cheap = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 4 + ("DOWN",) * 4,
+        stop_after_orders=2, allow_signal_flips=True, timeout=1.0,
+        leg_basis=(0.10, 0.001))
+    check("a complement that completes a profitable pair is still bought",
+          cheap["order_sides"] == ["UP", "DOWN"], str(cheap))
+
+    dear = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 4 + ("DOWN",) * 4,
+        stop_after_orders=2, allow_signal_flips=True, timeout=1.0,
+        leg_basis=(0.80, 0.02))
+    check("the signal-side entry is unaffected",
+          dear["order_sides"][:1] == ["UP"], str(dear))
+    check("a complement completing a pair above $1.00 is refused",
+          dear["order_sides"] == ["UP"], str(dear))
+
+    blind = await _drive_phase2_with_hold(
+        execution_mode="PAPER", held_provider=lambda *_a: set(),
+        price_votes=("UP",) * 4 + ("DOWN",) * 4,
+        stop_after_orders=2, allow_signal_flips=True, timeout=1.0,
+        leg_basis=None)
+    check("with no cost basis on record the complement fails closed",
+          blind["order_sides"] == ["UP"], str(blind))
 
 
 async def t_paper_signal_flip_restart_baseline_requires_a_later_transition():

@@ -1686,7 +1686,11 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # Entry bands, stake sizing, SIGNAL_DECISION_RULE, _authority_side, the
     # taper cadence and the reversal epoch are all untouched; strategy.py and
     # config.py are byte-identical.
-    "main_bot.py": "4a2195ab8d7e17a70421df54b0eb550e8e65fd702af1cf8d1655aeb443a82bb3",
+    # main_bot.py, config.py re-approved 2026-09-22: every complement
+    # purchase now prices the finished pair at the submit choke point
+    # (COMPLEMENT_REQUIRES_PROFIT). A matched pair pays exactly $1.00, and
+    # 72 of 89 completed pairs had cost more than that.
+    "main_bot.py": "1d4ed235ee481b46961f8f86f58bb0eda965163862d0c225dd75c0db80a68251",
     "strategy.py": "069e61b18709a6f56de1b54582ffd803fb695590341fd53e1c3dd670a2df1878",
     # config.py, polymarket_trade.py re-approved 2026-09-16: paper fill-delay
     # probes (PAPER_FILL_DELAY_PROBES) and live POST timing. Both diagnostic:
@@ -1701,7 +1705,7 @@ BASELINE_SHA = {  # approved trading-file baseline; intentional changes require 
     # config.py re-approved 2026-09-22: POSITION_SIZING/kelly_stake added.
     # Sizing only; default stays 'fixed' and kelly refuses any band without
     # a measured positive edge, so no path changes unless asked.
-    "config.py": "ec1a963806a301c62e01ed46f1c0f30f1f3e4c30b2730f1401ff873c5c58cb6c",
+    "config.py": "a7555c58831d5dd06ab5f3e6eb129991700e91499709df8749d7949638dd4a4e",
 }
 SIDES = (None, "UP", "DOWN")
 PRICES = (None, 0.0, 64_000.0, 64_894.0, 64_894.01, 1e9, -5.0)

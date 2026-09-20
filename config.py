@@ -509,6 +509,18 @@ if not math.isfinite(PAIR_LOCK_MIN_EDGE) or not 0.0 <= PAIR_LOCK_MIN_EDGE < 1.0:
     raise ValueError("PAIR_LOCK_MIN_EDGE must be in [0, 1)")
 
 
+# Every complement purchase - a signal flip, a taper hedge slot, anything
+# added later - must leave a pair that can still turn a profit. A matched
+# UP+DOWN pair redeems exactly $1.00, so a pair costing more is a certain
+# loss with no prediction involved. Measured on a paper session: 72 of 89
+# completed pairs cost over $1.00, worst $1.3199, -$152.17 locked in - 62%
+# of that session's entire loss. The paths that bought them did not price
+# the finished position at all.
+#
+# Defaults ON. Turning it off restores the old unpriced behaviour.
+COMPLEMENT_REQUIRES_PROFIT = bool(_env_bool("COMPLEMENT_REQUIRES_PROFIT", True))
+
+
 def pair_lock_permits(entry_price, entry_fee_per_share,
                       ask) -> tuple[bool, float]:
     """Would buying the complement at ``ask`` lock a profit on the pair?

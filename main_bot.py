@@ -662,6 +662,36 @@ def _pair_lock_permit(condition_id: str | None, other_token: str,
     )
 
 
+def _pair_profit_guard(condition_id: str | None, other_token: str,
+                       ask) -> tuple[bool, str]:
+    """Would completing this pair still make money? Fails closed.
+
+    Distinct from _pair_lock_permit, which asks "may I buy the complement
+    BECAUSE it locks a profit" and is opt-in through PAIR_LOCK_ENABLED. This
+    asks the weaker question every complement has to pass whatever chose it:
+    the finished pair must not cost more than the $1.00 it can ever pay.
+
+    LIVE has no per-leg cost basis provider, so this refuses there - which is
+    the behaviour LIVE wants anyway: it must never hold both legs by accident.
+    """
+    if _round_leg_basis_provider is None:
+        return False, "no per-leg cost basis on record for this mode"
+    try:
+        basis = _round_leg_basis_provider(condition_id, other_token)
+    except Exception as exc:
+        return False, f"ledger basis unavailable ({type(exc).__name__})"
+    if not basis:
+        return False, "the held leg has no readable cost basis"
+    entry, entry_fee = basis
+    _permitted, locked = config.pair_lock_permits(entry, entry_fee, ask)
+    if locked <= 0:
+        return False, (
+            f"pair would cost ${entry + entry_fee + float(ask):.4f} all-in "
+            f"for a $1.00 payout")
+    return True, (f"pair keeps ${locked:+.4f}/pair: held {entry:.3f}"
+                  f"+{entry_fee:.4f}fee plus this leg at {float(ask):.3f}")
+
+
 def _refresh_durable_round_state(window_start: int, condition_id: str | None,
                                  exposure: float,
                                  held_tokens: set[str]) -> tuple[float, set[str]]:
@@ -2052,6 +2082,38 @@ async def run_bot():
                           f"snapshot for the pre-submit guard.")
                     phase2_gate_until = _phase2_deadline()
                     continue
+
+            # INVENTORY: one choke point every complement purchase passes,
+            # whichever path selected it - a signal flip, a taper hedge slot,
+            # or anything added later. Each of those used to buy the other leg
+            # without pricing the finished position, and a matched pair pays
+            # exactly $1.00 however BTC moves, so a pair bought above that is
+            # a certain loss. This is the last point where that can be caught.
+            other_leg = down_id if entry_side == "UP" else up_id
+            if config.COMPLEMENT_REQUIRES_PROFIT and other_leg in held_tokens:
+                entry_token = up_id if entry_side == "UP" else down_id
+                try:
+                    _pair_bids, pair_asks = await asyncio.to_thread(
+                        orderbook.get_orderbook, entry_token)
+                except Exception as exc:
+                    print(f"{_ts()} [MARKET] complement pair check failed: "
+                          f"{type(exc).__name__}: {exc}")
+                    phase2_gate_until = _phase2_deadline(1.0)
+                    continue
+                if not pair_asks:
+                    print(f"{_ts()} [RISK] No order: no ask on the complement "
+                          f"leg to price the pair with.")
+                    phase2_gate_until = _phase2_deadline()
+                    continue
+                pair_ok, pair_detail = _pair_profit_guard(
+                    tokens["condition_id"], other_leg,
+                    float(pair_asks[0]["price"]))
+                if not pair_ok:
+                    print(f"{_ts()} [RISK] No order: completing this pair "
+                          f"loses money; {pair_detail}.")
+                    phase2_gate_until = _phase2_deadline()
+                    continue
+                print(f"{_ts()} [PAIR] complement allowed: {pair_detail}")
 
             verb = "Simulating live-book FOK" if mode == "PAPER" else "Placing trade"
             tag = " [TAPER HEDGE]" if is_taper_hedge else ""
