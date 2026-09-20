@@ -49,6 +49,18 @@ _originals: dict[tuple[object, str], object] = {}
 _orig_liquidity_signal = None
 _orig_get_orderbook = None
 _audit_lock = threading.RLock()
+# Token -> timestamps of the last book this process served to a caller.
+# Read by the order path through a hook so the order layer never imports
+# the feed layer.
+_book_meta: dict = {}
+_book_meta_lock = threading.RLock()
+
+
+def last_book_meta(token_id):
+    """Timestamps of the most recent book served for this token, or None."""
+    with _book_meta_lock:
+        meta = _book_meta.get(str(token_id))
+        return dict(meta) if meta else None
 
 
 def _env(name: str, default: str, allowed: tuple[str, ...]) -> str:
@@ -206,6 +218,31 @@ def install(hub: FeedHub, cfg: AdapterConfig | None = None, *, on_event=None):
 
     # ---- book source ------------------------------------------------------
     if cfg.book_source != "rest":
+        def _remember_book(token, view, source):
+            """Record the served book's own timestamps for the order path.
+
+            as_rest() throws away everything except prices and sizes, so the
+            order layer could not say how old the book it priced against
+            actually was. Ages must be computed from updated_mono against
+            another monotonic reading only - the exchange stamp is kept raw
+            and never subtracted from a local clock.
+            """
+            meta = {
+                "source": source,
+                "read_mono": time.monotonic(),
+                "exchange_ts_ms": None,
+                "updated_mono": None,
+                "generation": None,
+                "updates": None,
+            }
+            if view is not None:
+                meta["exchange_ts_ms"] = getattr(view, "exchange_ts_ms", None)
+                meta["updated_mono"] = getattr(view, "updated_mono", None)
+                meta["generation"] = getattr(view, "generation", None)
+                meta["updates"] = getattr(view, "updates", None)
+            with _book_meta_lock:
+                _book_meta[str(token)] = meta
+
         def wrap_book(orig):
             def inner(token_id, *a, **kw):
                 token = str(token_id)
@@ -221,10 +258,15 @@ def install(hub: FeedHub, cfg: AdapterConfig | None = None, *, on_event=None):
                             if hub.generation != _audit["gen"]:
                                 _audit["gen"] = hub.generation
                                 _audit["pending"] = (token, view, time.monotonic())
+                    _remember_book(token, view, "ws")
                     return view.as_rest()
 
                 # REST: startup, recovery and fallback only.
                 rest = orig(token_id, *a, **kw)
+                # A REST read has no view timestamps: parse_orderbook checked
+                # its exchange stamp but does not return it, so the age here
+                # is genuinely unknown rather than zero.
+                _remember_book(token, None, "rest")
                 if cfg.book_source == "ws":
                     hub.rest_fallbacks += 1
                     if on_event:

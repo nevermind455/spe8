@@ -653,6 +653,35 @@ def _ambiguous_blocks(condition_id: str, token_id: str) -> bool:
 
 
 attempt_log_failures = 0
+# Set by run_feeds to feeds.adapters.last_book_meta. Left None when no feed
+# is installed, in which case book ages are recorded as unavailable rather
+# than as zero.
+book_meta_provider = None
+
+
+def _book_meta(token_id):
+    """Timestamps for the book the order path just priced against."""
+    provider = book_meta_provider
+    if provider is None:
+        return None
+    try:
+        return provider(token_id)
+    except Exception:
+        return None
+
+
+def _book_age_s(meta, *, at_mono=None):
+    """Age of the served book in seconds, monotonic only, or None.
+
+    Never mixes clocks: updated_mono and the reading below both come from
+    time.monotonic(). A book served from REST carries no update stamp, so
+    its age is unavailable - which is recorded as None, never as 0.
+    """
+    if not meta or meta.get("updated_mono") is None:
+        return None
+    now = time.monotonic() if at_mono is None else at_mono
+    age = now - float(meta["updated_mono"])
+    return age if age >= 0 else None
 
 
 def _attempt_log(row: dict) -> None:
@@ -959,6 +988,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             raise RuntimeError(
                 "the effective price floor is above the order's price cap")
         book_read_wall = time.time()
+        book_read_mono = time.monotonic()
         _bids, asks = orderbook.validate_buy_liquidity(
             token_id, amount, float(limit), config.MAX_ALLOWED_SPREAD,
             min_price=float(floor))
@@ -1007,6 +1037,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
     # get, recorded BEFORE the first submission. Joined later to the confirmed
     # lots in the ledger by order id.
     try:
+        _meta = _book_meta(token_id)
         _best_ask = float(asks[0]["price"]) if asks else None
         _best_bid = float(_bids[0]["price"]) if _bids else None
         _exp_shares = float(shares)
@@ -1018,7 +1049,17 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             # What IS proven is that parse_orderbook accepted the book inside
             # ORDERBOOK_MAX_AGE_SECONDS, so this is an upper bound, not the
             # measured age. Closing that gap is a named follow-up.
+            # The limit parse_orderbook enforced. NOT a measurement, and
+            # deliberately unchanged in meaning.
             "book_age_bound_s": float(config.ORDERBOOK_MAX_AGE_SECONDS),
+            # Measured, when the feed served a websocket book. A REST book
+            # carries no update stamp, so these stay null rather than 0.
+            "book_source": (_meta or {}).get("source"),
+            "book_source_ts_ms": (_meta or {}).get("exchange_ts_ms"),
+            "book_updated_mono": (_meta or {}).get("updated_mono"),
+            "book_read_wall": book_read_wall,
+            "book_age_at_decision_s": _book_age_s(
+                _meta, at_mono=book_read_mono),
             "condition_id": str(condition_id), "token_id": str(token_id),
             "side": side, "order_side": "BUY", "order_type": "FOK",
             "window_end": window_end,
@@ -1070,6 +1111,8 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             print(f"[LIVE] Order blocked before submission: {last_order_error}")
             return False
         submitted_wall = time.time()
+        # Age of the same book at the moment of submission, monotonic only.
+        submit_book_age_s = _book_age_s(_book_meta(token_id))
         try:
             resp = client.post_order(signed, OrderType.FOK)
         except Exception as exc:
@@ -1106,6 +1149,7 @@ def _place_trade(side: str, amount: float, up_token_id: str | None = None,
             "order_id": oid, "status": None if status is None else str(status),
             "final_status": ("ACCEPTED" if err is None else "REJECTED"),
             "reason": (_safe_error(err)[:200] if err else None),
+            "book_age_at_submit_s": submit_book_age_s,
         })
         if err is not None:
             err = _safe_error(err)

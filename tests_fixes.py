@@ -3239,6 +3239,153 @@ def t_execution_readiness_block_is_recorded_with_its_reason():
         main_bot._execution_ready_provider = saved_ready
 
 
+def _clean_attempt(aid="a1", oid="o1", t0=1000.0):
+    """One well-formed attempt: genesis, submission, acceptance."""
+    return [
+        {"attempt_id": aid, "event": "attempt", "decision_wall": t0,
+         "book_read_wall": t0 + 0.1, "wall": t0 + 0.2},
+        {"attempt_id": aid, "event": "post", "order_id": oid,
+         "submitted_wall": t0 + 0.3, "responded_wall": t0 + 0.5,
+         "post_seconds": 0.2, "final_status": "ACCEPTED"},
+    ]
+
+
+def t_integrity_gate_refuses_to_pass_without_evidence():
+    """An empty journal must never read as PASS.
+
+    The whole point of the gate is to stop a calibration being built on
+    events that do not exist. A green light from no data is the exact
+    failure it is there to prevent.
+    """
+    import analyze_session as A
+
+    verdict, findings = A.integrity_report([], [])
+    check("no telemetry is NO DATA, not PASS", verdict == "NO DATA", verdict)
+    check("and it says why", bool(findings), str(findings))
+
+    verdict, findings = A.integrity_report(
+        _clean_attempt(), [{"order_id": "o1", "trade_id": "t1", "wall": 1001.0}])
+    check("a clean session passes", verdict == "PASS", str(findings))
+
+
+def t_integrity_gate_catches_every_corruption_it_claims_to():
+    """Each defect must be detected individually, not just in aggregate."""
+    import analyze_session as A
+
+    def verdict_for(attempts, lots):
+        v, f = A.integrity_report(attempts, lots)
+        return v, {name for name, _n, _e in f}
+
+    dup = _clean_attempt() + [
+        {"attempt_id": "a1", "event": "attempt", "decision_wall": 1000.0,
+         "wall": 1000.2}]
+    v, names = verdict_for(dup, [{"order_id": "o1", "wall": 1001.0}])
+    check("a duplicated genesis event fails",
+          v == "FAIL" and any("more than one genesis" in n for n in names),
+          str(names))
+
+    lots = [{"order_id": "o1", "trade_id": "t1", "wall": 1001.0},
+            {"order_id": "o1", "trade_id": "t1", "wall": 1001.0}]
+    v, names = verdict_for(_clean_attempt(), lots)
+    check("duplicate trade ids fail",
+          v == "FAIL" and any("duplicate fill" in n for n in names), str(names))
+
+    contradiction = _clean_attempt() + [
+        {"attempt_id": "a1", "event": "blocked", "wall": 1000.1}]
+    v, names = verdict_for(contradiction, [{"order_id": "o1", "wall": 1001.0}])
+    check("blocked-and-submitted is a lifecycle contradiction",
+          v == "FAIL" and any("blocked before submission and submitted" in n
+                              for n in names), str(names))
+
+    twice = _clean_attempt() + [
+        {"attempt_id": "a1", "event": "post", "order_id": "o2",
+         "submitted_wall": 1000.6, "responded_wall": 1000.7,
+         "final_status": "ACCEPTED"}]
+    v, names = verdict_for(twice, [{"order_id": "o1", "wall": 1001.0}])
+    check("two acceptances for one intended order fail",
+          v == "FAIL" and any("accepted more than once" in n for n in names),
+          str(names))
+
+    negative = _clean_attempt()
+    negative[1] = {**negative[1], "post_seconds": -0.4}
+    v, names = verdict_for(negative, [{"order_id": "o1", "wall": 1001.0}])
+    check("negative latency fails",
+          v == "FAIL" and any("negative POST latency" in n for n in names),
+          str(names))
+
+    backwards = _clean_attempt()
+    backwards[1] = {**backwards[1], "responded_wall": 1000.1}
+    v, names = verdict_for(backwards, [{"order_id": "o1", "wall": 1001.0}])
+    check("a response before its own submission fails",
+          v == "FAIL" and any("impossible order" in n for n in names),
+          str(names))
+
+    v, names = verdict_for(
+        _clean_attempt(),
+        [{"order_id": "o1", "wall": 1001.0},
+         {"order_id": "ghost", "trade_id": "t9", "wall": 1002.0}])
+    check("a fill with no recorded attempt fails",
+          v == "FAIL" and any("no recorded attempt" in n for n in names),
+          str(names))
+
+    v, names = verdict_for(_clean_attempt(),
+                           [{"order_id": "o1", "trade_id": "t1", "wall": 1000.25}])
+    check("a fill predating its submission fails",
+          v == "FAIL" and any("before their own submission" in n
+                              for n in names), str(names))
+
+    # A ledger older than the telemetry must not make history look orphaned.
+    v, names = verdict_for(
+        _clean_attempt(),
+        [{"order_id": "ancient", "trade_id": "t0", "wall": 500.0},
+         {"order_id": "o1", "trade_id": "t1", "wall": 1001.0}])
+    check("fills predating the telemetry window are not called orphans",
+          v == "PASS", str(names))
+
+
+def t_book_age_is_measured_from_one_clock_or_not_at_all():
+    """Never subtract a wall clock from a monotonic one, and never report 0.
+
+    A REST book carries no update stamp, so its age is genuinely unknown.
+    Recording that as zero would invent the most flattering possible value.
+    """
+    import time
+    import polymarket_trade as trade
+
+    saved = trade.book_meta_provider
+    try:
+        now = time.monotonic()
+        age = trade._book_age_s({"updated_mono": now - 0.75}, at_mono=now)
+        check("a websocket book reports a measured age",
+              age is not None and abs(age - 0.75) < 1e-6, str(age))
+        check("a book with no update stamp reports None, not 0",
+              trade._book_age_s({"source": "rest", "updated_mono": None})
+              is None)
+        check("no metadata at all reports None", trade._book_age_s(None) is None)
+        check("a stamp from the future is refused rather than negative",
+              trade._book_age_s({"updated_mono": now + 5.0}, at_mono=now) is None)
+
+        trade.book_meta_provider = None
+        check("with no feed installed the age is unavailable",
+              trade._book_meta("1") is None)
+
+        def explode(_token):
+            raise RuntimeError("feed gone")
+
+        trade.book_meta_provider = explode
+        check("a failing provider yields None, it does not raise",
+              trade._book_meta("1") is None)
+
+        trade.book_meta_provider = lambda _t: {"source": "ws",
+                                               "updated_mono": now - 0.2,
+                                               "exchange_ts_ms": 1700000000000}
+        meta = trade._book_meta("1")
+        check("the venue stamp is carried through raw",
+              meta["exchange_ts_ms"] == 1700000000000, str(meta))
+    finally:
+        trade.book_meta_provider = saved
+
+
 def main():
     # A crashing test must be one failure, not a suite that stops reporting.
     def run(fn, is_async=False):

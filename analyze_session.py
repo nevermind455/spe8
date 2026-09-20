@@ -280,6 +280,159 @@ def fill_delay_section(journal: pathlib.Path, pos: dict) -> None:
         print("   fills lose the winners - the adverse selection live showed.")
 
 
+def _read_events(path: pathlib.Path) -> list:
+    """Every parseable row of an append-only journal, in file order."""
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def integrity_report(attempts: list, lots: list) -> tuple:
+    """(verdict, findings) over the raw event data.
+
+    A session that fails this must not be used to calibrate PAPER: the
+    comparator's numbers are only as trustworthy as the events under them.
+
+    Deliberately returns NO DATA rather than PASS when there is nothing to
+    check. A green light from an empty journal is the exact failure mode this
+    report exists to prevent.
+    """
+    findings = []
+
+    def fail(name, offenders):
+        offenders = list(offenders)
+        if offenders:
+            findings.append((name, len(offenders), offenders[:3]))
+
+    by_attempt = collections.defaultdict(list)
+    for row in attempts:
+        if row.get("attempt_id"):
+            by_attempt[row["attempt_id"]].append(row)
+    if not by_attempt:
+        return "NO DATA", [("no attempt telemetry on record", 0, [])]
+
+    # 1. one genesis event per attempt
+    fail("attempt ids with more than one genesis event",
+         [aid for aid, rows in by_attempt.items()
+          if sum(1 for r in rows if r.get("event") in ("attempt", "blocked")) > 1])
+
+    # 2. duplicate authoritative trade ids
+    seen_trades = collections.Counter(
+        l.get("trade_id") or l.get("order_id") for l in lots)
+    fail("duplicate fill/trade ids",
+         [tid for tid, n in seen_trades.items() if tid and n > 1])
+
+    # 3. lifecycle contradiction: never submitted, yet submitted
+    fail("attempts both blocked before submission and submitted",
+         [aid for aid, rows in by_attempt.items()
+          if any(r.get("event") == "blocked" for r in rows)
+          and any(r.get("event") == "post" for r in rows)])
+
+    # 4. more than one acceptance for one intended order
+    fail("attempts accepted more than once",
+         [aid for aid, rows in by_attempt.items()
+          if sum(1 for r in rows
+                 if r.get("final_status") == "ACCEPTED") > 1])
+
+    # 5. accepted without an order id to correlate on
+    fail("accepted submissions with no order id",
+         [aid for aid, rows in by_attempt.items()
+          if any(r.get("final_status") == "ACCEPTED" and not r.get("order_id")
+                 for r in rows)])
+
+    # 6. negative latency
+    fail("negative POST latency",
+         [r.get("attempt_id") for r in attempts
+          if isinstance(r.get("post_seconds"), (int, float))
+          and r["post_seconds"] < 0])
+
+    # 7. impossible ordering within one attempt
+    out_of_order = []
+    for aid, rows in by_attempt.items():
+        genesis = next((r for r in rows if r.get("event") == "attempt"), None)
+        if not genesis:
+            continue
+        stamps = [genesis.get(k) for k in
+                  ("decision_wall", "book_read_wall", "wall")]
+        stamps = [s for s in stamps if isinstance(s, (int, float))]
+        if stamps != sorted(stamps):
+            out_of_order.append(aid)
+            continue
+        posts = [r for r in rows if r.get("event") == "post"]
+        for post in posts:
+            sub = post.get("submitted_wall")
+            resp = post.get("responded_wall")
+            if (isinstance(sub, (int, float)) and isinstance(resp, (int, float))
+                    and resp < sub):
+                out_of_order.append(aid)
+                break
+            if (isinstance(sub, (int, float)) and stamps
+                    and sub < stamps[0]):
+                out_of_order.append(aid)
+                break
+    fail("events timestamped in an impossible order", out_of_order)
+
+    # 8. fills that predate the submission that supposedly caused them, and
+    #    fills with no attempt at all. Both are restricted to the window the
+    #    telemetry actually covers: a ledger that predates the journal would
+    #    otherwise make every historical fill look orphaned.
+    submitted_at = {}
+    for rows in by_attempt.values():
+        for r in rows:
+            oid = r.get("order_id")
+            sub = r.get("submitted_wall")
+            if oid and isinstance(sub, (int, float)):
+                submitted_at[oid] = min(submitted_at.get(oid, sub), sub)
+    covered_from = min(
+        (r["wall"] for r in attempts if isinstance(r.get("wall"), (int, float))),
+        default=None)
+    in_window = [l for l in lots
+                 if covered_from is not None
+                 and isinstance(l.get("wall"), (int, float))
+                 and l["wall"] >= covered_from]
+    fail("confirmed fills with no recorded attempt",
+         [l.get("order_id") for l in in_window
+          if l.get("order_id") not in submitted_at])
+    fail("fills timestamped before their own submission",
+         [l.get("order_id") for l in in_window
+          if l.get("order_id") in submitted_at
+          and l["wall"] < submitted_at[l["order_id"]]])
+
+    return ("PASS" if not findings else "FAIL"), findings
+
+
+def integrity_section(attempts_path: pathlib.Path, lots: list) -> str:
+    """Print the integrity gate and return its verdict."""
+    attempts = _read_events(attempts_path)
+    verdict, findings = integrity_report(attempts, lots)
+    print(f"\nEVENT CHECK {verdict}   (telemetry integrity gate)")
+    if verdict == "NO DATA":
+        print("            no live attempt telemetry on record for this "
+              "ledger.")
+        print("            Nothing here is evidence about live execution, and")
+        print("            PAPER must not be calibrated from this session.")
+        return verdict
+    print(f"            {len(attempts)} events over "
+          f"{len({r.get('attempt_id') for r in attempts})} attempts")
+    for name, count, examples in findings:
+        print(f"            {count:>5}  {name}")
+        print(f"                   e.g. {', '.join(str(e)[:24] for e in examples)}")
+    if verdict == "PASS":
+        print("            no duplicate attempts or trade ids, no orphan "
+              "fills,")
+        print("            no impossible ordering, no negative latency.")
+    else:
+        print("            This session is NOT valid for PAPER/LIVE "
+              "calibration.")
+    return verdict
+
+
 def readiness_section(path: pathlib.Path) -> None:
     """Decisions LIVE refused to execute that PAPER would have taken.
 
@@ -804,6 +957,10 @@ def live_report(base: pathlib.Path) -> int:
               f"   {sig(total['n'], win, avg_px)}")
     print_bands(bands)
     pairs_section(held)
+    integrity_section(
+        path("LIVE_ATTEMPTS_PATH", "live_attempts.jsonl"),
+        [l for q in pos.values() for l in (q.get("lots") or [])
+         if str(l.get("side", "")).upper() == "BUY"])
     readiness_section(path("LIVE_DECISIONS_PATH", "live_decisions.jsonl"))
     attempts_section(path("LIVE_ATTEMPTS_PATH", "live_attempts.jsonl"), orders)
     live_timing_section(

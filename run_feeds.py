@@ -758,6 +758,7 @@ async def _run_configured(hub, cfg, agreement, *, dash: bool = False,
         # a pair whose first half never existed.
         main_bot._round_leg_basis_provider = (
             lambda condition, token: ledger.open_leg_basis(condition, token))
+        polymarket_trade.book_meta_provider = adapters.last_book_meta
         main_bot._execution_ready_provider = hub.user.ready_for_market
         # Explains a refusal without being the gate; see Finding 5.
         main_bot._execution_block_reason_provider = hub.user.ready_reason_for_market
