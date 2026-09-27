@@ -86,7 +86,11 @@ def check(window: int | None, raw: bool) -> int:
     now = timer.unix()
     window = timer.window_start(now) if window is None else int(window)
     slug = f"btc-updown-5m-{window}"
-    print(f"market: {slug}\n")
+    print(f"market: {slug}")
+    print(f"venue:  {CLOB}  (gamma: {market_discovery.GAMMA})")
+    print("        Polymarket US (polymarket.us) is a SEPARATE exchange with")
+    print("        its own incentive programs. Anything documented only there")
+    print("        does not apply to this host.\n")
 
     event = market_discovery._fetch_slug(slug)
     if not isinstance(event, dict):

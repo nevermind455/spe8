@@ -134,8 +134,52 @@ Three things that number is not:
    share is $15/day no matter how much you turn over. Do not build a $30k/day
    plan on a $50/day pool.
 
-So: rebates are a real answer to "profit from volume", and they are the only
-one on this venue. They are also a different bot, and the hurdle is 84 bps of
+### The third program: volume incentive pools
+
+There is also a **Volume Incentive Program** that pays on volume rank rather
+than on side — you earn a share of a fixed pool proportional to your share of
+the eligible volume in a contract. Takers appear to count. That is closest to
+"profit from volume" as usually meant.
+
+**Two things kill it as a plan, and the second is arithmetic.**
+
+First, entity. It is documented on `docs.polymarket.us` — Polymarket US
+(QCX LLC, CFTC-regulated), which is a **separate exchange**. `config.py` pins
+`CLOB_HOST` to `clob.polymarket.com` and refuses any other host unless
+`ALLOW_CUSTOM_CLOB_HOST` is set. A program on the US venue does not apply to
+this bot as configured.
+
+Second, dilution. A rebate pays a fixed *percentage* of the fees your own
+fills generated, so the rate is immune to how busy the market is. A fixed pool
+pays `pool × (yours ÷ total)`, so **every other participant dilutes your
+rate** — and your own volume is in that denominator too. On a $5,000 pool,
+trading 25,000 contracts at 0.40 (fee: 1.68c a contract):
+
+| total volume | your share | you earn | per contract | vs your fee | net |
+|---|---|---|---|---|---|
+| 100,000 | 25.0% | $1,250 | 5.00c | 298% | **+$830** |
+| 250,000 | 10.0% | $500 | 2.00c | 119% | +$80 |
+| 500,000 | 5.0% | $250 | 1.00c | 60% | **−$170** |
+| 1,000,000 | 2.5% | $125 | 0.50c | 30% | −$295 |
+| 5,000,000 | 0.5% | $25 | 0.10c | 6% | −$395 |
+
+The pool pays the taker fee exactly at **297,619 total contracts**. Below
+that, trading is fee-free or better. Above it, you are paying to farm.
+
+Note which row is Polymarket's own worked example: 25,000 of 500,000 for $250.
+At their illustration's own numbers a taker farming the pool is **down $170 on
+fees alone**, before any trading PnL. The example is not a profit case.
+
+So a volume pool is a race that gets worse as it gets more popular, and it is
+worth farming only in contracts nobody else has found. That is the opposite of
+a scalable plan.
+
+```bash
+python3 maker_rebate.py --volume-pool 5000 --your-contracts 25000
+```
+
+So: rebates are a real answer to "profit from volume", and they are the
+steadiest one on this venue. They are also a different bot, and the hurdle is 84 bps of
 adverse selection. Do not switch the live config to chase them on the strength
 of a table in a markdown file.
 

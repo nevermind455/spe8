@@ -681,5 +681,76 @@ def t_rebate_default_share_is_flagged_unverified():
           "rewards_check.py" in src)
 
 
+# ------------------------------------- 9 VOLUME POOLS (a diluting reward) ---
+def t_volume_pool_dilutes_with_total_volume():
+    import maker_rebate as mr
+    kw = dict(pool=5000.0, your_contracts=25_000.0, price=0.40, theta=0.07)
+    thin = mr.volume_incentive(total_contracts=100_000, **kw)
+    thick = mr.volume_incentive(total_contracts=1_000_000, **kw)
+    check("the same volume earns less in a busier pool",
+          thick["reward"] < thin["reward"],
+          f"{thin['reward']} -> {thick['reward']}")
+    check("ten times the total volume is a tenth of the reward",
+          abs(thick["reward"] - thin["reward"] / 10) < 1e-6)
+    check("which is the OPPOSITE of a rebate, whose rate is fixed",
+          mr.breakdown(volume=1000, price=0.40, theta=0.07,
+                       rebate_share=0.20)["rebate_bps"]
+          == mr.breakdown(volume=999_999, price=0.40, theta=0.07,
+                          rebate_share=0.20)["rebate_bps"])
+
+
+def t_volume_pool_breakeven_against_the_taker_fee():
+    """The pool covers the fee only below a total-volume threshold."""
+    import maker_rebate as mr
+    kw = dict(pool=5000.0, your_contracts=25_000.0, price=0.40, theta=0.07)
+    fee_per_share = 0.07 * 0.40 * 0.60
+    be = 5000.0 / fee_per_share
+    at = mr.volume_incentive(total_contracts=be, **kw)
+    check("at the break-even total the pool exactly pays the fee",
+          abs(at["covers_fee"] - 1.0) < 1e-6, str(at["covers_fee"]))
+    check("and net is zero there", abs(at["net"]) < 0.01, str(at["net"]))
+    below = mr.volume_incentive(total_contracts=be / 2, **kw)
+    above = mr.volume_incentive(total_contracts=be * 2, **kw)
+    check("below it a taker is better than fee-free", below["net"] > 0)
+    check("above it a taker is paying to farm", above["net"] < 0)
+
+
+def t_volume_pool_at_polymarkets_own_example_loses_money():
+    """25,000 of 500,000 contracts for $250 - their doc's worked example."""
+    import maker_rebate as mr
+    v = mr.volume_incentive(pool=5000.0, your_contracts=25_000.0,
+                            total_contracts=500_000.0, price=0.40, theta=0.07)
+    check("the example pays $250", abs(v["reward"] - 250.0) < 0.01,
+          str(v["reward"]))
+    check("your share is 5%", abs(v["share"] - 0.05) < 1e-9)
+    check("which covers only ~60% of the taker fee",
+          0.55 < v["covers_fee"] < 0.65, f"{v['covers_fee']:.3f}")
+    check("so a taker farming it is still down on fees alone",
+          v["net"] < 0, str(v["net"]))
+
+
+def t_volume_pool_guards_bad_input():
+    import maker_rebate as mr
+    check("no pool means no result",
+          mr.volume_incentive(pool=0.0, your_contracts=1, total_contracts=1,
+                              price=0.4, theta=0.07) == {})
+    check("no total volume means no result (never divide by it)",
+          mr.volume_incentive(pool=100.0, your_contracts=1, total_contracts=0,
+                              price=0.4, theta=0.07) == {})
+
+
+def t_entity_difference_is_stated_in_the_code():
+    """A US-only program must not be quietly priced as if it applied here."""
+    import maker_rebate as mr
+    check("the module carries an entity note", bool(mr.ENTITY_NOTE))
+    check("naming polymarket.us", "polymarket.us" in mr.ENTITY_NOTE)
+    check("and the host this bot actually trades",
+          "clob.polymarket.com" in mr.ENTITY_NOTE)
+    import config
+    check("which is the host config pins",
+          config.CLOB_HOST == "https://clob.polymarket.com",
+          config.CLOB_HOST)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

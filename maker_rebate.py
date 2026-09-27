@@ -50,6 +50,16 @@ import argparse
 DEFAULT_REBATE_SHARE = 0.20
 UNVERIFIED = True
 
+# Polymarket US (QCX LLC, CFTC-regulated) and polymarket.com are DIFFERENT
+# exchanges with different incentive programs. config.py pins CLOB_HOST to
+# clob.polymarket.com and refuses any other host unless ALLOW_CUSTOM_CLOB_HOST
+# is set, so a program documented only on docs.polymarket.us does not
+# automatically apply to this bot. Check which entity a program belongs to
+# before sizing anything on it.
+ENTITY_NOTE = ("the Volume Incentive Program is documented on "
+               "docs.polymarket.us (Polymarket US); this bot trades "
+               "clob.polymarket.com")
+
 
 def fee_on_notional(notional: float, price: float, theta: float) -> float:
     """Taker fee for `notional` dollars filled at `price`. Shares cancel."""
@@ -141,6 +151,83 @@ def report_liquidity_pool(pool: float, share: float, volume: float,
         print("     staying inside max-spread matter more than turnover.")
 
 
+# ------------------------------------------------- volume incentive pools ---
+def volume_incentive(*, pool: float, your_contracts: float,
+                     total_contracts: float, price: float,
+                     theta: float) -> dict:
+    """A FIXED pool per contract, split pro-rata by volume traded.
+
+    This is a different shape from a rebate and the difference is the whole
+    point. A rebate pays a fixed PERCENTAGE of the fees your own fills
+    generated, so the rate is immune to how many others are trading. A fixed
+    pool pays `pool * (yours / total)`, so every other participant's volume
+    DILUTES your rate. "More volume earns more rewards" is true for you
+    individually and false for the rate: in a crowded pool everyone trades
+    more and everyone earns less per contract.
+
+    Reported per SHARE (contract), not per dollar, because that is the unit
+    these pools are denominated in and the unit the fee compares against:
+
+        fee per share    = theta * p * (1 - p)
+        reward per share = pool / total_contracts
+
+    so the pool covers the taker fee only while `total_contracts` stays below
+    `pool / (theta * p * (1-p))`. Past that, trading into it costs money.
+    """
+    if total_contracts <= 0 or pool <= 0:
+        return {}
+    share = your_contracts / total_contracts
+    reward = pool * share
+    per_share = pool / total_contracts
+    fee_per_share = theta * price * (1.0 - price)
+    notional = your_contracts * price
+    return {
+        "share": share,
+        "reward": reward,
+        "per_share": per_share,
+        "fee_per_share": fee_per_share,
+        "covers_fee": per_share / fee_per_share if fee_per_share else float("inf"),
+        "reward_bps": (per_share / price) * 10_000 if price else 0.0,
+        "net_per_share": per_share - fee_per_share,
+        "net": (per_share - fee_per_share) * your_contracts,
+        "notional": notional,
+        # Total volume at which the pool exactly pays the taker fee.
+        "breakeven_total": pool / fee_per_share if fee_per_share else float("inf"),
+    }
+
+
+def report_volume_incentive(pool: float, your_contracts: float,
+                            totals: tuple[float, ...], price: float,
+                            theta: float) -> None:
+    print(f"\n! ENTITY: {ENTITY_NOTE}.")
+    print("! Confirm the program covers the venue you actually trade before "
+          "using any of this.")
+    print(f"\nVOLUME INCENTIVE POOL - ${pool:,.0f} split pro-rata by volume")
+    print(f"you trade {your_contracts:,.0f} contracts at {price:.2f} "
+          f"(${your_contracts * price:,.0f} notional)")
+    print("-" * 74)
+    fee_ps = theta * price * (1.0 - price)
+    print(f"  your taker fee is {fee_ps * 100:.2f}c per contract "
+          f"(${fee_ps * your_contracts:,.2f} total)")
+    print(f"\n{'total volume':>14}{'your share':>12}{'you earn':>11}"
+          f"{'per contract':>14}{'vs fee':>9}{'net':>11}")
+    for total in totals:
+        v = volume_incentive(pool=pool, your_contracts=your_contracts,
+                             total_contracts=total, price=price, theta=theta)
+        if not v:
+            continue
+        print(f"{total:>14,.0f}{v['share'] * 100:>11.1f}%{v['reward']:>11,.0f}"
+              f"{v['per_share'] * 100:>12.2f}c{v['covers_fee'] * 100:>8.0f}%"
+              f"{v['net']:>11,.0f}")
+    be = pool / fee_ps if fee_ps else float("inf")
+    print(f"\n  The pool pays the taker fee exactly at {be:,.0f} total "
+          f"contracts.")
+    print(f"  Below that, trading is fee-free or better. Above it, you are "
+          f"paying to farm.")
+    print("  Your own volume is IN the denominator, so farming harder moves")
+    print("  the market toward the bad side of that line.")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--volume", type=float, default=30_000.0,
@@ -158,6 +245,11 @@ def main(argv=None) -> int:
                          "(read it with rewards_check.py)")
     ap.add_argument("--pool-share", type=float, default=0.10,
                     help="your expected share of that pool by score")
+    ap.add_argument("--volume-pool", type=float, default=0.0,
+                    help="a VOLUME INCENTIVE pool for one contract, in dollars "
+                         "(Polymarket US; see the entity warning)")
+    ap.add_argument("--your-contracts", type=float, default=25_000.0,
+                    help="contracts (shares) you trade into that pool")
     args = ap.parse_args(argv)
 
     if UNVERIFIED and args.rebate_share == DEFAULT_REBATE_SHARE:
@@ -172,6 +264,11 @@ def main(argv=None) -> int:
     if args.pool > 0:
         report_liquidity_pool(args.pool, args.pool_share, args.volume,
                               args.price, args.theta, args.rebate_share)
+    if args.volume_pool > 0:
+        report_volume_incentive(
+            args.volume_pool, args.your_contracts,
+            (100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000),
+            args.price, args.theta)
     print()
     return 0
 
