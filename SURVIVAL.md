@@ -96,9 +96,48 @@ better. Which of those is true is measurable — the book tape already records
 both sides of the ladder every tick, so a resting order's fill can be replayed
 against it — and it is not currently measured.
 
+### $30,000 a day, priced out
+
+```bash
+python3 maker_rebate.py --volume 30000
+```
+
+The fee on a fixed notional is `N * theta * (1-p)`, so it is a flat percentage
+of volume that shrinks as price rises. A rebate returning 20% of it pays:
+
+| avg price | taker PAYS/day | maker EARNS/day | rebate rate |
+|---|---|---|---|
+| 0.30 | −$1,470 | +$294 | 98 bps |
+| 0.40 | −$1,260 | +$252 | 84 bps |
+| 0.50 | −$1,050 | +$210 | 70 bps |
+| 0.60 | −$840 | +$168 | 56 bps |
+
+At 0.40 that is **$252/day, about $7,560/month** — and the *same* volume as a
+taker is **−$1,260/day, −$37,800/month**. A $1,512/day swing decided purely by
+which side of the book you are on. The pro-rata allocation cancels out (your
+slice of the pool is proportional to the fees your own fills generated), so
+competition does not cut the *rate* — it only limits how much you get filled.
+
+Three things that number is not:
+
+1. **It is gross revenue on volume, not profit.** The break-even is an
+   identity: **the adverse-selection loss that cancels the rebate is exactly
+   the rebate rate** — 84 bps of notional at 0.40, or $252/day on $30k. Lose
+   more than that on the positions and the volume costs you money at any size.
+2. **$30k/day in one market needs $104 of filled volume every 5-minute round**
+   — 41 fills a round at $2.50. Your maker volume cannot exceed the taker flow
+   that actually arrives, so the market's own 24h volume is a hard ceiling.
+   `rewards_check.py` prints it.
+3. **Liquidity rewards are a different animal** and do not scale with volume:
+   a fixed daily pool per market, split by score on resting size and distance
+   from midpoint, diluted by every other maker. A $100/day pool at a 15% score
+   share is $15/day no matter how much you turn over. Do not build a $30k/day
+   plan on a $50/day pool.
+
 So: rebates are a real answer to "profit from volume", and they are the only
-one on this venue. They are also a different bot. Do not switch the live
-config to chase them on the strength of a table in a markdown file.
+one on this venue. They are also a different bot, and the hurdle is 84 bps of
+adverse selection. Do not switch the live config to chase them on the strength
+of a table in a markdown file.
 
 ## What the tool does
 

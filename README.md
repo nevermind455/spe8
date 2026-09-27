@@ -95,6 +95,7 @@ python book_backtest.py               # BOOK vs QUOTE, side by side
 python band_tuner.py --sweep          # rank bands, with the noise floor shown
 python survival.py --sweep-bet        # ruin risk and what stake survives
 python rewards_check.py               # what this market pays a maker
+python maker_rebate.py --volume 30000 # what that volume earns, by side
 ```
 
 `GATE1.md` explains what the two engines do and how to read the verdict.

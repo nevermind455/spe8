@@ -618,5 +618,68 @@ def t_survival_posterior_is_bounded_and_centred():
           _st.stdev(wide) > _st.stdev(narrow))
 
 
+# ------------------------------------------- 8 REBATES (maker_rebate.py) ---
+def t_rebate_fee_is_linear_in_notional_and_falls_with_price():
+    import maker_rebate as mr
+    from accounting import fees
+    # The closed form must agree with the real per-share fee function.
+    for price in (0.30, 0.40, 0.55, 0.70):
+        notional = 1000.0
+        closed = mr.fee_on_notional(notional, price, 0.07)
+        per_share = fees.taker_fee(notional / price, price, th=0.07)
+        check(f"closed form matches taker_fee at {price:.2f}",
+              abs(closed - per_share) < 0.02, f"{closed} vs {per_share}")
+    check("a cheaper fill generates MORE fee on the same notional",
+          mr.fee_on_notional(1000, 0.30, 0.07) > mr.fee_on_notional(1000, 0.60, 0.07))
+
+
+def t_rebate_scales_with_volume_and_share():
+    import maker_rebate as mr
+    a = mr.breakdown(volume=30_000, price=0.40, theta=0.07, rebate_share=0.20)
+    b = mr.breakdown(volume=60_000, price=0.40, theta=0.07, rebate_share=0.20)
+    check("double the volume, double the rebate",
+          abs(b["rebate"] - 2 * a["rebate"]) < 1e-6)
+    check("the rate in bps is unchanged by volume",
+          abs(b["rebate_bps"] - a["rebate_bps"]) < 1e-9)
+    zero = mr.breakdown(volume=30_000, price=0.40, theta=0.07, rebate_share=0.0)
+    check("no rebate share means no rebate", zero["rebate"] == 0.0)
+
+
+def t_rebate_breakeven_equals_the_rebate_rate():
+    """The hurdle is the rate itself - that identity is the whole warning."""
+    import maker_rebate as mr
+    for price in (0.30, 0.45, 0.60):
+        b = mr.breakdown(volume=30_000, price=price, theta=0.07,
+                         rebate_share=0.20)
+        check(f"break-even adverse selection == rebate rate at {price:.2f}",
+              abs(b["breakeven_adverse_bps"] - b["rebate_bps"]) < 1e-9)
+    b = mr.breakdown(volume=30_000, price=0.40, theta=0.07, rebate_share=0.20)
+    check("and at 0.40 that hurdle is about 84bps of notional",
+          83.0 < b["breakeven_adverse_bps"] < 85.0,
+          f"{b['breakeven_adverse_bps']:.1f}")
+
+
+def t_rebate_is_dwarfed_by_the_taker_bill_on_the_same_volume():
+    """Same volume, opposite sign. The side of the book is the whole answer."""
+    import maker_rebate as mr
+    b = mr.breakdown(volume=30_000, price=0.40, theta=0.07, rebate_share=0.20)
+    check("the taker pays the full fee", abs(b["fee"] - 1260.0) < 0.01,
+          str(b["fee"]))
+    check("the maker earns only the rebated share",
+          abs(b["rebate"] - 252.0) < 0.01, str(b["rebate"]))
+    check("so the bill is 5x the income at a 20% share",
+          abs(b["fee"] / b["rebate"] - 5.0) < 1e-6)
+
+
+def t_rebate_default_share_is_flagged_unverified():
+    """A secondary-source number must not be able to pass as measured."""
+    import maker_rebate as mr
+    check("the default share is marked unverified in the module",
+          mr.UNVERIFIED is True)
+    src = (ROOT / "maker_rebate.py").read_text(encoding="utf-8")
+    check("and the warning names rewards_check.py as the way to verify",
+          "rewards_check.py" in src)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

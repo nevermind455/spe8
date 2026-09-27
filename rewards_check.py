@@ -50,7 +50,10 @@ CLOB = "https://clob.polymarket.com"
 # Names seen across API versions and docs. Presence, not absence, is the
 # signal here - see the module docstring.
 REWARD_HINTS = ("reward", "rebate", "incentive", "fee", "spread", "min_size",
-                "minsize", "maker", "taker")
+                "minsize", "maker", "taker",
+                # Volume caps how much maker flow you can possibly capture:
+                # you cannot make $30k/day in a market that trades $3k.
+                "volume", "liquidity", "openinterest", "open_interest")
 
 
 def _interesting(obj, path="") -> list[tuple[str, object]]:
@@ -152,6 +155,14 @@ def check(window: int | None, raw: bool) -> int:
             print(f"\n--- RAW CLOB book meta for {token} ---")
             print(json.dumps(_get(f"{CLOB}/book", token_id=token),
                              indent=1, sort_keys=True)[:2000])
+
+    print("\n--- the ceiling on maker volume ---")
+    for key in ("volume", "volume24hr", "volumeNum", "volume1wk",
+                "liquidity", "liquidityNum", "openInterest"):
+        if key in market:
+            print(f"  {key} = {market[key]!r}")
+    print("  Your maker volume cannot exceed the taker flow that arrives.")
+    print("  A rebate rate means nothing if the market does not trade.")
 
     print("\nReminder: makers pay no trading fee, but a maker is filled when")
     print("the market moves against them. At a 0.39 fill the fee saved is")
