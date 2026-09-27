@@ -137,9 +137,11 @@ floor exists to refuse.
   fills against the book it saw, so it is still optimistic by one round trip.
 * **Impact.** A $2.50 taker does not move this market, so the walk consumes
   depth without repricing it. That assumption fails at size.
-* **Queue position.** Every trade here is a taker buy, because the bot crosses
-  the spread and the maker rebate is zero. No resting-order fill is modelled,
-  because none happens.
+* **Queue position.** Every trade here is a taker buy, because the bot sends
+  FOK orders. No resting-order fill is modelled, because this build never
+  rests one - not because resting is worthless. Makers pay no fee and can
+  earn rebates and liquidity rewards; `SURVIVAL.md` sizes that path and
+  `rewards_check.py` reads what this market actually pays.
 * **Coverage.** The tape is only as good as the hours you recorded. `stats`
   prints the span and the per-round snapshot counts; a band with no snapshots
   in its seconds-left range is untestable, not zero.

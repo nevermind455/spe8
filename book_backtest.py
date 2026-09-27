@@ -36,9 +36,11 @@ The gap between them is the part of your edge that only ever existed on
 paper. If BOOK is red while QUOTE is green, the strategy does not work and
 the price line was hiding it.
 
-Every trade is a taker buy: this venue's maker rebate is zero and the bot
-crosses the spread, so there is no configuration in which a resting order
-was what actually happened.
+Every trade is a taker buy, because the bot sends FOK orders and a market
+order is always a taker. That is a fact about this bot, not about the venue:
+makers here pay no fee at all and can earn a share of maker rebates and
+liquidity rewards. This build simply earns none of it, so no resting-order
+fill is modelled. See SURVIVAL.md for what that path would be worth.
 """
 from __future__ import annotations
 

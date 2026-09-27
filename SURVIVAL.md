@@ -36,10 +36,69 @@ sits about 1.7 points of win rate above the price paid:
 More trades do not reduce this. They pay it more often. Any "profit from
 volume" story has to clear it first, on every fill.
 
-The one genuine volume-revenue mechanism on this venue is maker liquidity
-rewards, and this bot cannot earn them: it crosses the spread on every entry
-and the maker rebate is zero. Earning those would be a different bot, not a
-larger version of this one.
+## Where "profit from volume" is literally true
+
+There is one place on this venue where volume genuinely pays, independent of
+predicting anything - and it is the maker side, which this build never touches.
+Two separate flows, both configured **per market**:
+
+* **Maker rebates.** A share of the taker fees collected in a market, paid
+  back to makers whose limit orders filled, pro-rata by the fee-equivalent
+  volume their liquidity generated. Reported at 20% of collected taker fees in
+  crypto after the July 2026 fee update (25% in most categories, 15% sports),
+  paid daily, $1 minimum.
+* **Liquidity rewards.** A daily pool for *resting* limit orders inside a
+  configured max spread from the adjusted midpoint, scored by size and
+  distance from best, subject to a minimum qualifying size. Only markets in
+  the venue's sampling set carry a pool.
+
+Both numbers above are from secondary sources, not a first-hand read - the
+container this was written in cannot reach `polymarket.com`. **Do not size
+anything on them.** `rewards_check.py` reads the real config for the actual
+BTC 5-minute market and prints it; run that on a box with network access
+before treating any of this as a number.
+
+### What the maker side is worth, before rebates
+
+Makers pay no trading fee. That alone removes the entire per-fill hurdle:
+
+| price | taker must win | maker must win | hurdle removed |
+|---|---|---|---|
+| 0.35 | 36.59% | 35.00% | 1.59pp |
+| 0.40 | 41.68% | 40.00% | 1.68pp |
+| 0.50 | 51.75% | 50.00% | 1.75pp |
+| 0.60 | 61.68% | 60.00% | 1.68pp |
+
+Against phase 1's measured +5.84pp edge, the fee hurdle is 1.66pp — **28% of
+the whole edge is fee drag**. Removing it takes EV from +15.1% to +19.3% per
+dollar staked, with no improvement in prediction whatsoever. Rebates would sit
+on top of that. This is a bigger lever than any band retune on the table.
+
+### Why it is not free money
+
+A maker does not choose when to trade. A maker is filled *because* someone
+else decided the price was wrong, and in a 5-minute BTC market that someone is
+usually acting on a spot move the resting order has not repriced for. That is
+adverse selection, and the arithmetic is unforgiving:
+
+**1.68pp of win rate lost to adverse selection cancels the entire fee saving.**
+
+| true win rate | maker EV per $1 |
+|---|---|
+| 46.30% (no adverse selection) | +0.193 |
+| 44.62% (−1.68pp) | +0.150 — same as taking |
+| 43.30% (−3.00pp) | +0.116 |
+| 41.30% (−5.00pp) | +0.064 |
+
+1.68pp is a small number to lose to informed flow. It is entirely plausible
+that making is worse here than taking, and equally plausible that it is much
+better. Which of those is true is measurable — the book tape already records
+both sides of the ladder every tick, so a resting order's fill can be replayed
+against it — and it is not currently measured.
+
+So: rebates are a real answer to "profit from volume", and they are the only
+one on this venue. They are also a different bot. Do not switch the live
+config to chase them on the strength of a table in a markdown file.
 
 ## What the tool does
 
