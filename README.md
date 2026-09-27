@@ -93,10 +93,13 @@ python book_recorder.py record        # leave running
 python book_recorder.py resolve       # who actually won each round
 python book_backtest.py               # BOOK vs QUOTE, side by side
 python band_tuner.py --sweep          # rank bands, with the noise floor shown
+python survival.py --sweep-bet        # ruin risk and what stake survives
 ```
 
 `GATE1.md` explains what the two engines do and how to read the verdict.
+`SURVIVAL.md` covers stake sizing, ruin risk, and why volume amplifies
+the sign of an edge rather than supplying one.
 
-See `PAPER_MODE.md`, `FEEDS.md`, `ACCOUNTING.md`, `GATE1.md`, and
+See `PAPER_MODE.md`, `FEEDS.md`, `ACCOUNTING.md`, `GATE1.md`, `SURVIVAL.md`, and
 `DEEP_AUDIT.md` for the execution model, persistence files, safeguards,
 findings, and remaining risks.

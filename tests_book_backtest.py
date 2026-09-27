@@ -520,5 +520,103 @@ def t_tuner_report_refuses_to_rank_an_empty_tape():
     check("and it says the search was unadjusted",
           "unadjusted for the search" in buf.getvalue())
 
+# ------------------------------------------------ 7 SURVIVAL (survival.py) ---
+def t_survival_trade_arithmetic():
+    import survival
+    from accounting import fees
+    up, down = survival.trade_outcomes(0.40, 2.50, 0.07)
+    shares = 2.50 / 0.40
+    fee = fees.taker_fee(shares, 0.40, th=0.07)
+    check("a win pays shares minus stake minus fee",
+          abs(up - (shares - 2.50 - fee)) < 1e-9, str(up))
+    check("a loss costs stake plus fee",
+          abs(down + (2.50 + fee)) < 1e-9, str(down))
+    check("the fee is charged on the loss too, not just the win", down < -2.50)
+
+
+def t_survival_ev_sign_tracks_the_hurdle():
+    import survival
+    from accounting import fees
+    be = fees.breakeven_win_rate(0.40, th=0.07)
+    at = survival.per_trade(0.40, 2.50, be, 0.07)
+    check("at the break-even win rate EV is ~zero", abs(at["ev"]) < 5e-3,
+          str(at["ev"]))
+    check("and the edge reads as ~zero pp", abs(at["edge_pp"]) < 0.01)
+    above = survival.per_trade(0.40, 2.50, be + 0.05, 0.07)
+    below = survival.per_trade(0.40, 2.50, be - 0.05, 0.07)
+    check("above it EV is positive", above["ev"] > 0)
+    check("below it EV is negative", below["ev"] < 0)
+    check("a losing edge gets a non-positive Kelly fraction",
+          below["kelly"] <= 0, str(below["kelly"]))
+
+
+def t_survival_ruin_is_absorbing():
+    """A stopped-out account stops trading; it does not trade back out."""
+    import survival
+    out = survival.simulate(bankroll=100.0, bet=10.0, price=0.50,
+                            win_rate=0.20, theta=0.07, rounds=500,
+                            trials=200, fills=None, ruin_floor=0.5, seed=0)
+    check("a hopeless edge ruins nearly always", out["ruin"] > 0.9,
+          f"ruin {out['ruin']}")
+    check("and the account is left at or below the floor, not below zero",
+          out["median_final"] <= 50.0 and out["p05"] >= -10.0,
+          f"median {out['median_final']}, p05 {out['p05']}")
+
+
+def t_survival_volume_amplifies_the_sign():
+    """The correction to 'volume will pay us': size multiplies, never creates."""
+    import survival
+    kw = dict(bankroll=1000.0, price=0.40, theta=0.07, rounds=3000,
+              trials=400, fills=None, ruin_floor=0.5, seed=0)
+    from accounting import fees
+    be = fees.breakeven_win_rate(0.40, th=0.07)
+
+    small = survival.simulate(bet=1.0, win_rate=be - 0.04, **kw)
+    big = survival.simulate(bet=10.0, win_rate=be - 0.04, **kw)
+    check("with a NEGATIVE edge, betting bigger ruins more often",
+          big["ruin"] > small["ruin"], f"{small['ruin']} -> {big['ruin']}")
+
+    won_small = survival.simulate(bet=1.0, win_rate=be + 0.06, **kw)
+    won_big = survival.simulate(bet=10.0, win_rate=be + 0.06, **kw)
+    check("with a POSITIVE edge, betting bigger earns more",
+          won_big["median_final"] > won_small["median_final"])
+    check("but still ruins more often - size buys variance, not edge",
+          won_big["ruin"] >= won_small["ruin"],
+          f"{won_small['ruin']} -> {won_big['ruin']}")
+
+
+def t_survival_uncertainty_is_carried_not_assumed():
+    """A win rate from few fills must produce more ruin than one from many."""
+    import survival
+    kw = dict(bankroll=1000.0, bet=5.0, price=0.40, win_rate=0.47,
+              theta=0.07, rounds=3000, trials=600, ruin_floor=0.5, seed=0)
+    thin = survival.simulate(fills=40, **kw)
+    thick = survival.simulate(fills=4000, **kw)
+    exact = survival.simulate(fills=None, **kw)
+    check("an edge seen only 40 times is riskier than one seen 4000 times",
+          thin["ruin"] > thick["ruin"],
+          f"40 fills: {thin['ruin']}, 4000: {thick['ruin']}")
+    check("assuming the rate is exact is the most optimistic of the three",
+          exact["ruin"] <= thin["ruin"],
+          f"exact {exact['ruin']} vs thin {thin['ruin']}")
+
+
+def t_survival_posterior_is_bounded_and_centred():
+    import survival
+    import random
+    rng = random.Random(0)
+    draws = [survival.posterior_draw(rng, 46, 100) for _ in range(500)]
+    check("every draw is a probability",
+          all(0.0 <= d <= 1.0 for d in draws))
+    check("the draws centre near what was observed",
+          abs(sum(draws) / len(draws) - 0.46) < 0.05,
+          f"mean {sum(draws) / len(draws):.3f}")
+    wide = [survival.posterior_draw(rng, 5, 10) for _ in range(500)]
+    narrow = [survival.posterior_draw(rng, 500, 1000) for _ in range(500)]
+    import statistics as _st
+    check("fewer observations give a wider posterior",
+          _st.stdev(wide) > _st.stdev(narrow))
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
