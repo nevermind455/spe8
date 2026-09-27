@@ -143,11 +143,26 @@ the eligible volume in a contract. Takers appear to count. That is closest to
 
 **Two things kill it as a plan, and the second is arithmetic.**
 
-First, entity. It is documented on `docs.polymarket.us` — Polymarket US
-(QCX LLC, CFTC-regulated), which is a **separate exchange**. `config.py` pins
-`CLOB_HOST` to `clob.polymarket.com` and refuses any other host unless
-`ALLOW_CUSTOM_CLOB_HOST` is set. A program on the US venue does not apply to
-this bot as configured.
+First, entity. Polymarket runs **two venues under one brand**, with separate
+order books and different product lists:
+
+| | polymarket.com | Polymarket US (QCX) |
+|---|---|---|
+| status | international, offshore | CFTC-regulated DCM |
+| settlement | USDC on Polygon | USD via intermediaries |
+| access | self-custodial wallet, no KYC | full identity verification |
+| US users | geoblocked since the 2022 CFTC settlement | this is the US route |
+| auth | EIP-712 signatures | Ed25519 |
+| this bot | **points here** (`config.py`) | not reachable as built |
+
+The Volume Incentive Program is documented on `docs.polymarket.us`, so it
+belongs to the US venue. The US venue *does* have a bot-accessible API — this
+is not a "humans only" wall — but reaching it is a **port, not a config
+flip**: different host, different auth (`config.py` pins `CLOB_HOST` to
+`clob.polymarket.com` and refuses other hosts unless `ALLOW_CUSTOM_CLOB_HOST`
+is set, and this build signs EIP-712), different market list. Whether it even
+lists a BTC 5-minute up/down market is **unverified** — and if it does not,
+none of this strategy transfers at any price.
 
 Second, dilution. A rebate pays a fixed *percentage* of the fees your own
 fills generated, so the rate is immune to how busy the market is. A fixed pool

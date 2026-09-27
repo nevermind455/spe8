@@ -50,15 +50,27 @@ import argparse
 DEFAULT_REBATE_SHARE = 0.20
 UNVERIFIED = True
 
-# Polymarket US (QCX LLC, CFTC-regulated) and polymarket.com are DIFFERENT
-# exchanges with different incentive programs. config.py pins CLOB_HOST to
-# clob.polymarket.com and refuses any other host unless ALLOW_CUSTOM_CLOB_HOST
-# is set, so a program documented only on docs.polymarket.us does not
-# automatically apply to this bot. Check which entity a program belongs to
-# before sizing anything on it.
+# Polymarket runs TWO venues under one brand, with separate order books and
+# separate product lists:
+#
+#   polymarket.com  international, settles USDC on Polygon, self-custodial
+#                   wallet, no KYC. Geoblocked from US addresses since the
+#                   2022 CFTC settlement. THIS is what config.py points at.
+#   Polymarket US   QCX LLC, a CFTC-regulated designated contract market
+#                   acquired in 2025. USD settlement, full identity
+#                   verification. Has its own API (Ed25519 auth), so it is
+#                   bot-reachable - but with different auth, a different
+#                   host and a different market list.
+#
+# A liquidity or volume program documented on docs.polymarket.us belongs to
+# the US venue. Moving there is a port, not a config flip: config.py pins
+# CLOB_HOST to clob.polymarket.com and refuses other hosts unless
+# ALLOW_CUSTOM_CLOB_HOST is set, and this build signs EIP-712, not Ed25519.
+# Whether the US venue even lists a BTC 5-minute up/down market is unverified.
 ENTITY_NOTE = ("the Volume Incentive Program is documented on "
-               "docs.polymarket.us (Polymarket US); this bot trades "
-               "clob.polymarket.com")
+               "docs.polymarket.us (Polymarket US, a separate CFTC-regulated "
+               "exchange with its own order book and Ed25519 auth); this bot "
+               "trades clob.polymarket.com")
 
 
 def fee_on_notional(notional: float, price: float, theta: float) -> float:
